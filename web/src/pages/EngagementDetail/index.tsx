@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, lazy, Suspense, type FC } from 'react'
+import { useState, useEffect, useCallback, useRef, lazy, Suspense, type FC } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
   Activity,
@@ -35,11 +35,21 @@ import { packageLocationMap, countVulnerabilityFindings, VulnsTab } from './Vuln
 import { LicensesTab } from './LicensesTab'
 import { ComponentsTab } from './ComponentsTab'
 import { ReconTab } from './ReconTab'
+import { ScanRunsTab } from './ScanRunsTab'
+import { PurpleCoverageTab } from './PurpleCoverageTab'
+import { ChainRehearsalTab } from './ChainRehearsalTab'
+import { RiskStoriesTab } from './RiskStoriesTab'
+import { VulnPostureTab } from './VulnPostureTab'
+import { CredentialsTab } from './CredentialsTab'
 import { DetectionsTab } from './DetectionsTab'
+import { ImportedFindingsTab } from './ImportedFindingsTab'
 import { DataGovernanceTab } from './DataGovernanceTab'
+import { WriteupDraftsTab } from './WriteupDraftsTab'
+import { CloudPostureTab } from './CloudPostureTab'
 import { EvidenceTab } from './EvidenceTab'
 import { SettingsTab } from './SettingsTab'
 import { JudgmentReviewTab } from './ReviewsTab'
+import { ARCHIVED_REASON, isReadOnly } from './readOnly'
 
 // Lazy-loaded so React Flow stays out of the initial bundle (only the Graph tab needs it).
 const DependencyGraphTab = lazy(() => import('../DependencyGraph').then((m) => ({ default: m.DependencyGraphTab })))
@@ -47,19 +57,28 @@ const DependencyGraphTab = lazy(() => import('../DependencyGraph').then((m) => (
 export type Tab =
   | 'overview'
   | 'findings'
+  | 'imported'
   | 'sla'
+  | 'risk-stories'
+  | 'vuln-posture'
   | 'components'
   | 'vulns'
   | 'licenses'
   | 'graph'
+  | 'scanruns'
+  | 'credentials'
   | 'quality'
   | 'threats'
   | 'recon'
+  | 'purple'
+  | 'rehearsal'
   | 'agent'
+  | 'cspm'
   | 'detections'
   | 'reviews'
   | 'evidence'
   | 'data-governance'
+  | 'writeup-drafts'
   | 'settings'
 
 export interface SubTabDefinition {
@@ -87,6 +106,9 @@ export const TAB_GROUPS: TabGroupDefinition[] = [
     icon: ShieldZap,
     sub: [
       { id: 'findings', label: 'All Findings', countKey: 'findings' },
+      { id: 'imported', label: 'Imported' },
+      { id: 'risk-stories', label: 'Risk Stories' },
+      { id: 'vuln-posture', label: 'Vuln Posture' },
       { id: 'sla', label: 'Remediation SLA' },
     ],
   },
@@ -99,6 +121,7 @@ export const TAB_GROUPS: TabGroupDefinition[] = [
       { id: 'vulns', label: 'Vulnerabilities', countKey: 'vulns' },
       { id: 'licenses', label: 'Licenses', countKey: 'licenses' },
       { id: 'graph', label: 'Dependency Graph' },
+      { id: 'scanruns', label: 'Scan Runs' },
     ],
   },
   {
@@ -108,7 +131,10 @@ export const TAB_GROUPS: TabGroupDefinition[] = [
     sub: [
       { id: 'recon', label: 'Recon' },
       { id: 'threats', label: 'Threat Model' },
+      { id: 'purple', label: 'Purple Coverage' },
+      { id: 'rehearsal', label: 'Chain Rehearsal' },
       { id: 'agent', label: 'Agent' },
+      { id: 'cspm', label: 'Cloud Posture' },
     ],
   },
   {
@@ -125,7 +151,9 @@ export const TAB_GROUPS: TabGroupDefinition[] = [
       { id: 'evidence', label: 'Evidence' },
       { id: 'reviews', label: 'Awaiting Review' },
       { id: 'quality', label: 'Code Quality' },
+      { id: 'credentials', label: 'Credentials' },
       { id: 'data-governance', label: 'Data governance' },
+      { id: 'writeup-drafts', label: 'Write-up Drafts' },
     ],
   },
   {
@@ -165,6 +193,7 @@ export function EngagementDetail() {
   // /engagements/:id/<tab> deep links land on the right tab.
   const [tab, setTabState] = useState<Tab>(() => (isTab(tabSlug) ? tabSlug : 'overview'))
   const [findingsFilter, setFindingsFilter] = useState<Severity | 'all'>('all')
+  const tablistRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (isTab(tabSlug)) setTabState(tabSlug)
@@ -255,11 +284,43 @@ export function EngagementDetail() {
     setFindings((cur) => (cur ? cur.map((f) => (f.id === updated.id ? updated : f)) : cur))
   }
 
+  const activeGroup = getGroupForTab(tab)
+
   // selectSeverity wires the Overview's distribution + attention cards to the
   // Findings table (the decision surface).
   function selectSeverity(sev: Severity | 'all') {
     setFindingsFilter(sev)
     setTab('findings')
+  }
+
+  function selectGroup(group: TabGroupDefinition) {
+    if (group.sub && group.sub.length > 0) {
+      if (activeGroup.id !== group.id) setTab(group.sub[0].id)
+      return
+    }
+    setTab(group.id as Tab)
+  }
+
+  // WAI-ARIA tabs pattern: Left/Right move between tabs, Home/End jump to the
+  // ends, and the newly selected tab takes focus.
+  function onTablistKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']
+    if (!keys.includes(event.key)) return
+    const current = TAB_GROUPS.findIndex((g) => g.id === activeGroup.id)
+    if (current < 0) return
+    event.preventDefault()
+    const last = TAB_GROUPS.length - 1
+    const nextIndex =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? last
+          : event.key === 'ArrowLeft'
+            ? (current - 1 + TAB_GROUPS.length) % TAB_GROUPS.length
+            : (current + 1) % TAB_GROUPS.length
+    const target = TAB_GROUPS[nextIndex]
+    selectGroup(target)
+    tablistRef.current?.querySelector<HTMLButtonElement>(`#tab-${target.id}`)?.focus()
   }
 
   if (engErr)
@@ -297,14 +358,13 @@ export function EngagementDetail() {
     )
   }
 
+  const archived = isReadOnly(eng)
   const counts = {
     findings: findings?.length ?? 0,
     components: scan?.components.length ?? 0,
     vulns: scan ? countVulnerabilityFindings(scan.vulnerabilities, packageLocationMap(scan.components)) : 0,
     licenses: scan?.licenses.length ?? 0,
   }
-
-  const activeGroup = getGroupForTab(tab)
 
   return (
     <div className="mx-auto max-w-[1600px] animate-fade-in space-y-5">
@@ -350,12 +410,15 @@ export function EngagementDetail() {
         />
       </div>
 
-      {/* 2-Tier Navigation Section */}
-      <div className="space-y-2.5">
+      {/* 2-Tier Navigation Section. Sticky so a tab switch does not leave the
+          reader hunting for the content below a tall hero. */}
+      <div className="sticky top-0 z-20 -mx-4 space-y-2.5 bg-secondary-subtle px-4 pt-2 sm:-mx-6 sm:px-6 xl:-mx-8 xl:px-8">
         {/* Level 1: Main Tabs */}
         <div
+          ref={tablistRef}
           role="tablist"
           aria-label="Engagement Views"
+          onKeyDown={onTablistKeyDown}
           className="flex gap-2 overflow-x-auto border-b border-secondary"
         >
           {TAB_GROUPS.map((group) => {
@@ -374,15 +437,9 @@ export function EngagementDetail() {
                 id={`tab-${group.id}`}
                 aria-selected={isGroupActive}
                 aria-controls="engagement-tabpanel"
-                onClick={() => {
-                  if (group.sub && group.sub.length > 0) {
-                    if (activeGroup.id !== group.id) {
-                      setTab(group.sub[0].id)
-                    }
-                  } else {
-                    setTab(group.id as Tab)
-                  }
-                }}
+                // Roving tabindex: one stop for the whole tablist, arrows move within it.
+                tabIndex={isGroupActive ? 0 : -1}
+                onClick={() => selectGroup(group)}
                 className={cn(
                   '-mb-px inline-flex items-center gap-2 whitespace-nowrap border-b-2 px-3.5 py-2.5 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-solid',
                   isGroupActive
@@ -457,9 +514,13 @@ export function EngagementDetail() {
             focusedFindingId={focusedFindingId}
             onUpdated={applyFinding}
             onReload={reloadFindings}
+            readOnly={archived}
+            readOnlyReason={archived ? ARCHIVED_REASON : undefined}
           />
         )}
         {tab === 'sla' && <SLATab key={id} engagementId={id} findings={findings} />}
+        {tab === 'risk-stories' && <RiskStoriesTab key={id} engagementId={id} />}
+        {tab === 'vuln-posture' && <VulnPostureTab key={id} engagementId={id} />}
         {tab === 'components' && <ComponentsTab scan={scan} />}
         {tab === 'vulns' && <VulnsTab scan={scan} />}
         {tab === 'graph' && (
@@ -468,14 +529,21 @@ export function EngagementDetail() {
           </Suspense>
         )}
         {tab === 'licenses' && <LicensesTab scan={scan} />}
+        {tab === 'scanruns' && <ScanRunsTab key={id} engagementId={id} />}
         {tab === 'threats' && <ThreatModelTab engagementId={id} />}
         {tab === 'quality' && <CodeQualityTab engagementId={id} />}
         {tab === 'recon' && <ReconTab eng={eng} onGoTab={setTab} />}
+        {tab === 'purple' && <PurpleCoverageTab key={id} engagementId={id} />}
+        {tab === 'rehearsal' && <ChainRehearsalTab key={id} engagementId={id} />}
         {tab === 'agent' && <AgentTab engagementId={id} />}
         {tab === 'detections' && <DetectionsTab key={id} engagementId={id} />}
+        {tab === 'imported' && <ImportedFindingsTab key={id} engagementId={id} />}
         {tab === 'data-governance' && <DataGovernanceTab key={id} engagementId={id} />}
+        {tab === 'writeup-drafts' && <WriteupDraftsTab key={id} engagementId={id} />}
+        {tab === 'cspm' && <CloudPostureTab key={id} engagementId={id} />}
         {tab === 'reviews' && <JudgmentReviewTab key={id} engagementId={id} />}
         {tab === 'evidence' && <EvidenceTab key={id} engagementId={id} />}
+        {tab === 'credentials' && <CredentialsTab key={id} engagementId={id} />}
         {tab === 'settings' && <SettingsTab eng={eng} onUpdated={setEng} />}
       </div>
     </div>

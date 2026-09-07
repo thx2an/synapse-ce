@@ -32,13 +32,15 @@ type projectService interface {
 	Delete(context.Context, string, shared.ID, string) error
 	AssignGate(context.Context, string, shared.ID, string, string) (*project.Project, error)
 	StartAnalysis(context.Context, string, shared.ID, string, *measure.CoverageReport) (ports.ScanJob, error)
+	ImportAnalysis(context.Context, shared.ID, string, projectuc.ImportAnalysisInput) (projectanalysis.Analysis, error)
 	AnalysisStatus(context.Context, shared.ID, string) (ports.ScanJob, error)
-	LatestAnalysis(context.Context, shared.ID, string) (projectuc.LatestAnalysis, error)
+	LatestAnalysis(context.Context, shared.ID, string, string) (projectuc.LatestAnalysis, error)
 	ProjectDependencyGraph(context.Context, shared.ID, string) (projectuc.DependencyGraph, error)
 	ExportProjectDependencySubtree(context.Context, shared.ID, string, string) ([]byte, string, error)
-	Overview(context.Context, shared.ID, string) (projectuc.Overview, error)
+	Overview(context.Context, shared.ID, string, string) (projectuc.Overview, error)
 	GetMeasures(context.Context, string, string, string, []string, int, string) (projectuc.ProjectMeasureResponse, error)
-	ListAnalyses(context.Context, shared.ID, string, int, time.Time, shared.ID) ([]projectanalysis.Analysis, bool, error)
+	ListAnalyses(context.Context, shared.ID, string, string, int, time.Time, shared.ID) ([]projectanalysis.Analysis, bool, error)
+	Branches(context.Context, shared.ID, string) ([]string, error)
 	GetAnalysis(context.Context, shared.ID, string, string) (projectanalysis.Analysis, error)
 	ListCodeFiles(context.Context, shared.ID, string, string) ([]projectuc.CodeFile, projectanalysis.SourceCapabilities, error)
 	ListCodeFilesWithFilter(context.Context, shared.ID, string, string, projectuc.CodeFileFilter) ([]projectuc.CodeFile, projectanalysis.SourceCapabilities, error)
@@ -102,12 +104,13 @@ func (rt *Router) createProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, p)
+	writeJSON(w, http.StatusCreated, toProjectView(p))
 }
 
 type projectSummaryAnalysisResponse struct {
 	ID           string                   `json:"id"`
 	CreatedAt    time.Time                `json:"created_at"`
+	Origin       projectanalysis.Origin   `json:"origin"`
 	SourceCommit string                   `json:"source_commit,omitempty"`
 	GatePassed   bool                     `json:"gate_passed"`
 	GateInfo     projectanalysis.GateInfo `json:"gate_info"`
@@ -131,14 +134,15 @@ type projectSummaryJobResponse struct {
 }
 
 type projectSummaryResponse struct {
-	ID                   shared.ID                       `json:"ID"`
-	TenantID             shared.ID                       `json:"TenantID"`
-	Name                 string                          `json:"Name"`
-	Key                  string                          `json:"Key"`
-	SourceBinding        project.SourceBinding           `json:"SourceBinding"`
-	DefaultProfileByLang map[string]string               `json:"DefaultProfileByLang"`
-	GateID               string                          `json:"GateID"`
-	Audit                shared.Audit                    `json:"Audit"`
+	ID                   string                          `json:"id"`
+	TenantID             string                          `json:"tenant_id"`
+	Name                 string                          `json:"name"`
+	Key                  string                          `json:"key"`
+	SourceBinding        project.SourceBinding           `json:"source_binding"`
+	DefaultProfileByLang map[string]string               `json:"default_profile_by_lang"`
+	GateID               string                          `json:"gate_id,omitempty"`
+	CreatedAt            time.Time                       `json:"created_at"`
+	UpdatedAt            time.Time                       `json:"updated_at"`
 	LatestAnalysis       *projectSummaryAnalysisResponse `json:"latest_analysis"`
 	LatestJob            *projectSummaryJobResponse      `json:"latest_job"`
 }
@@ -152,11 +156,20 @@ func (rt *Router) listProjects(w http.ResponseWriter, r *http.Request) {
 	out := make([]projectSummaryResponse, len(list))
 	for i, summary := range list {
 		p := summary.Project
-		out[i] = projectSummaryResponse{ID: p.ID, TenantID: p.TenantID, Name: p.Name, Key: p.Key, SourceBinding: p.SourceBinding, DefaultProfileByLang: p.DefaultProfileByLang, GateID: p.GateID, Audit: p.Audit}
+		view := toProjectView(p)
+		out[i] = projectSummaryResponse{
+			ID: view.ID, TenantID: view.TenantID, Name: view.Name, Key: view.Key,
+			SourceBinding: view.SourceBinding, DefaultProfileByLang: view.DefaultProfileByLang,
+			GateID: view.GateID, CreatedAt: view.CreatedAt, UpdatedAt: view.UpdatedAt,
+		}
 		if summary.LatestAnalysis != nil {
 			analysis := summary.LatestAnalysis
+			origin := analysis.Origin
+			if !origin.Valid() {
+				origin = projectanalysis.OriginServer
+			}
 			out[i].LatestAnalysis = &projectSummaryAnalysisResponse{
-				ID: analysis.ID, CreatedAt: analysis.CreatedAt, SourceCommit: analysis.SourceCommit,
+				ID: analysis.ID, CreatedAt: analysis.CreatedAt, Origin: origin, SourceCommit: analysis.SourceCommit,
 				GatePassed: analysis.Gate.Passed, GateInfo: analysis.GateInfo, Issues: analysis.Issues,
 				NewIssues: analysis.NewCode.Counts.Total,
 				Rating: struct {
@@ -180,7 +193,7 @@ func (rt *Router) getProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSON(w, http.StatusOK, toProjectView(p))
 }
 
 func (rt *Router) deleteProject(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +217,7 @@ func (rt *Router) assignProjectGate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSON(w, http.StatusOK, toProjectView(p))
 }
 
 type projectAnalysisJobResponse struct {
@@ -281,7 +294,8 @@ func (rt *Router) projectAnalysisStatus(w http.ResponseWriter, r *http.Request) 
 }
 
 func (rt *Router) latestProjectAnalysis(w http.ResponseWriter, r *http.Request) {
-	latest, err := rt.projects.LatestAnalysis(r.Context(), shared.ID(TenantFrom(r.Context())), r.PathValue("key"))
+	branch := strings.TrimSpace(r.URL.Query().Get("branch"))
+	latest, err := rt.projects.LatestAnalysis(r.Context(), shared.ID(TenantFrom(r.Context())), r.PathValue("key"), branch)
 	if err != nil {
 		writeError(w, rt.log, err)
 		return
@@ -296,6 +310,22 @@ func (rt *Router) latestProjectAnalysis(w http.ResponseWriter, r *http.Request) 
 		Analysis projectAnalysisResponse `json:"analysis"`
 		Result   json.RawMessage         `json:"result"`
 	}{Analysis: projectAnalysisDTO(latest.Analysis), Result: result})
+}
+
+type projectBranchesResponse struct {
+	Branches []string `json:"branches"`
+}
+
+func (rt *Router) listProjectBranches(w http.ResponseWriter, r *http.Request) {
+	branches, err := rt.projects.Branches(r.Context(), shared.ID(TenantFrom(r.Context())), r.PathValue("key"))
+	if err != nil {
+		writeError(w, rt.log, err)
+		return
+	}
+	if branches == nil {
+		branches = []string{}
+	}
+	writeJSON(w, http.StatusOK, projectBranchesResponse{Branches: branches})
 }
 
 func (rt *Router) sanitizeProjectAnalysisResult(ctx context.Context, data []byte) ([]byte, error) {

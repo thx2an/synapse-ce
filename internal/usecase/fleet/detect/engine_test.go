@@ -323,3 +323,74 @@ func TestEngineRunLoopProcessesThenStops(t *testing.T) {
 		t.Error("Run must start the sensor")
 	}
 }
+
+func dnsEvent(at time.Time, remote string) detection.Event {
+	return detection.Event{Class: detection.ClassNetwork, At: at, Host: "host-1",
+		Network: &detection.NetworkEvent{Proto: "udp", RemoteAddr: remote, RemotePort: 53, Direction: "egress", PID: 9, Comm: "beacon"}}
+}
+
+// The DNS rule is windowed: single packets emit nothing, a burst to one destination emits one detection
+// whose evidence is the burst (capped at MaxEvidence), and the count restarts after it fires.
+func TestEngineWindowedRuleFiresOnBurstOnly(t *testing.T) {
+	sensor := newFakeSensor()
+	sink := &fakeSink{}
+	eng := newEngine(t, sensor, sink, Options{Classes: []detection.Class{detection.ClassNetwork}})
+	rule, ok := detection.Lookup("det.suspicious_dns_beacon")
+	if !ok || !rule.Windowed() {
+		t.Fatalf("dns rule = %+v", rule)
+	}
+	t0 := time.Unix(1_000, 0)
+	// Spread across two destinations, each below the count: nothing.
+	for i := 0; i < rule.Window.Count-1; i++ {
+		eng.process(context.Background(), dnsEvent(t0.Add(time.Duration(i)*100*time.Millisecond), "10.0.0.53"))
+		eng.process(context.Background(), dnsEvent(t0.Add(time.Duration(i)*100*time.Millisecond), "10.0.0.54"))
+	}
+	if got := sink.detections(); len(got) != 0 {
+		t.Fatalf("emitted %d detections below the burst threshold", len(got))
+	}
+	eng.process(context.Background(), dnsEvent(t0.Add(time.Duration(rule.Window.Count)*100*time.Millisecond), "10.0.0.53"))
+	got := sink.detections()
+	if len(got) != 1 || got[0].RuleID != rule.ID || got[0].RuleVersion != 2 {
+		t.Fatalf("detections = %+v", got)
+	}
+	if len(got[0].Evidence) != detection.MaxEvidence || !got[0].Truncated {
+		t.Fatalf("burst evidence = %d truncated=%v", len(got[0].Evidence), got[0].Truncated)
+	}
+	for _, e := range got[0].Evidence {
+		if e.Network.RemoteAddr != "10.0.0.53" {
+			t.Fatalf("evidence from another destination: %+v", e)
+		}
+	}
+	// The other destination is still one short; one more packet to it fires its own detection.
+	eng.process(context.Background(), dnsEvent(t0.Add(time.Duration(rule.Window.Count+1)*100*time.Millisecond), "10.0.0.54"))
+	if got := sink.detections(); len(got) != 2 {
+		t.Fatalf("second destination did not fire independently: %d", len(got))
+	}
+}
+
+// TestEngineEmitsSequenceDetection: a downloader then a remote-shell tool on one host becomes a single
+// det.tool_staging_sequence detection carrying the ordered pair as evidence, proving the engine routes a
+// sequence match through the burst-detection path.
+func TestEngineEmitsSequenceDetection(t *testing.T) {
+	sensor, sink := newFakeSensor(), &fakeSink{}
+	e := newEngine(t, sensor, sink, Options{Classes: []detection.Class{detection.ClassProcess}})
+
+	e.process(context.Background(), procEvent("curl")) // staging: no detection yet
+	if got := sink.detections(); len(got) != 0 {
+		t.Fatalf("the staging step alone must not detect, got %d", len(got))
+	}
+	e.process(context.Background(), procEvent("ncat")) // use: completes the sequence
+
+	var seq *detection.Detection
+	for i, d := range sink.detections() {
+		if d.RuleID == "det.tool_staging_sequence" {
+			seq = &sink.detections()[i]
+		}
+	}
+	if seq == nil {
+		t.Fatalf("the tool-staging sequence was not detected: %+v", sink.detections())
+	}
+	if len(seq.Evidence) != 2 || seq.Evidence[0].Process.Comm != "curl" || seq.Evidence[1].Process.Comm != "ncat" {
+		t.Fatalf("sequence evidence is not the ordered pair: %+v", seq.Evidence)
+	}
+}

@@ -17,6 +17,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/synapse-api ./cmd/synapse-api \
     && CGO_ENABLED=0 go build -trimpath -o /out/synapse-worker ./cmd/synapse-worker \
+    && CGO_ENABLED=0 go build -trimpath -o /out/synapse-egress-broker ./cmd/synapse-egress-broker \
     && CGO_ENABLED=0 go build -trimpath -o /out/synapse-sandbox-check ./cmd/synapse-sandbox-check \
     && CGO_ENABLED=0 go build -trimpath -o /out/synapse-migrate ./cmd/synapse-migrate \
     && CGO_ENABLED=0 go build -trimpath -o /out/synapse-dast-helper ./cmd/synapse-dast-helper \
@@ -42,6 +43,17 @@ FROM anchore/grype:v0.115.0 AS grype
 
 # ---------------------------------------------------------------------------
 # target: full – batteries-included local-development SCA image.
+#
+# LAYER ORDER IS LOAD-BEARING. The JVM toolchain below is the first instruction after the base
+# image, and the compiled binaries arrive afterwards through COPY --from=build. BuildKit keys this
+# RUN on the base image and the command text alone, so editing anything under cmd/ or internal/
+# rebuilds only the Go compile stage and reuses the toolchain layer (measured: 70s of Go compile,
+# JVM layer CACHED). Moving a COPY --from=build above this RUN, or inserting an ARG or a COPY of
+# repository content before it, would put a one-minute apt install plus a Gradle download on the
+# critical path of every rebuild.
+#
+# The toolchain itself stays: JVM SCA shells out to mvn and gradle to resolve transitive dependency
+# trees. --target api is the build for anyone who does not need that (roughly 320 MB against 940).
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS full
 ARG GRADLE_VERSION=8.10.2
@@ -113,6 +125,7 @@ RUN apt-get update \
          /var/lib/synapse/cache
 COPY --from=build /out/synapse-api /opt/synapse/synapse-api
 COPY --from=build /out/synapse-worker /opt/synapse/synapse-worker
+COPY --from=build /out/synapse-egress-broker /opt/synapse/synapse-egress-broker
 COPY --from=build /out/synapse-sandbox-check /opt/synapse/synapse-sandbox-check
 COPY --from=build /out/synapse-migrate /opt/synapse/synapse-migrate
 COPY --from=build /out/synapse-dast-helper /opt/synapse/synapse-dast-helper

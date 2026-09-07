@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/domain/shared"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/sourcepackage"
 	enguc "github.com/KKloudTarus/synapse-ce/internal/usecase/engagement"
+	"github.com/KKloudTarus/synapse-ce/internal/usecase/ports"
 )
 
 const createEngagementMetadataLimit = int64(1 << 20)
@@ -151,7 +153,9 @@ func (rt *Router) createEngagement(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	} else if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, createEngagementMetadataLimit)).Decode(&req); err != nil {
+		// The route carries the source-archive ceiling for the multipart branch, so the JSON
+		// branch states its own bound rather than inheriting one sized for a 512 MiB upload.
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid json body"})
 		return
 	}
@@ -205,7 +209,7 @@ func (rt *Router) createEngagement(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, e)
+	writeJSON(w, http.StatusCreated, toEngagementView(e))
 }
 
 func (rt *Router) listEngagements(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +220,63 @@ func (rt *Router) listEngagements(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	views := toEngagementViews(list)
+	if err := rt.enrichEngagementViews(r.Context(), views); err != nil {
+		writeError(w, rt.log, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, views)
+}
+
+// SetFindingSummaries wires the batched finding counter the engagement list uses for its Findings
+// column. Optional: without it rows carry no findings_count.
+func (rt *Router) SetFindingSummaries(r ports.FindingSummaryReader) { rt.findingSummaries = r }
+
+// SetScanJobs wires the scan job store the engagement list uses for its Last scan column. Optional:
+// without it rows carry no last_scan_date.
+func (rt *Router) SetScanJobs(s ports.ScanJobStore) { rt.scanJobs = s }
+
+// enrichEngagementViews attaches open finding counts and the latest scan to every row in two batched
+// reads (one GROUP BY over the rows' findings, one lateral latest-job lookup), so the list costs O(1)
+// queries however many engagements the tenant has.
+func (rt *Router) enrichEngagementViews(ctx context.Context, views []engagementView) error {
+	if len(views) == 0 || (rt.findingSummaries == nil && rt.scanJobs == nil) {
+		return nil
+	}
+	ids := make([]shared.ID, len(views))
+	for i := range views {
+		ids[i] = shared.ID(views[i].ID)
+	}
+	if rt.findingSummaries != nil {
+		sums, err := rt.findingSummaries.SummarizeOpenFindingsByEngagements(ctx, ids)
+		if err != nil {
+			return fmt.Errorf("summarize engagement findings: %w", err)
+		}
+		for i := range views {
+			if s, ok := sums[ids[i]]; ok {
+				views[i].FindingsCount = &engagementFindingsView{Total: s.Total, Critical: s.Critical, High: s.High, Medium: s.Medium, Low: s.Low, Info: s.Info}
+			}
+		}
+	}
+	if rt.scanJobs != nil {
+		jobs, err := rt.scanJobs.LatestForEngagements(ctx, ids)
+		if err != nil {
+			return fmt.Errorf("latest engagement scans: %w", err)
+		}
+		for i := range views {
+			job, ok := jobs[ids[i]]
+			if !ok {
+				continue
+			}
+			at := job.StartedAt
+			if job.FinishedAt != nil {
+				at = *job.FinishedAt
+			}
+			views[i].LastScanDate = &at
+			views[i].LastScanStatus = string(job.Status)
+		}
+	}
+	return nil
 }
 
 func (rt *Router) getEngagement(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +285,7 @@ func (rt *Router) getEngagement(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSON(w, http.StatusOK, toEngagementView(e))
 }
 
 type updateScopeRequest struct {
@@ -247,7 +307,7 @@ func (rt *Router) updateScope(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSON(w, http.StatusOK, toEngagementView(e))
 }
 
 type setWindowRequest struct {
@@ -284,7 +344,31 @@ func (rt *Router) setAuthorizationWindow(w http.ResponseWriter, r *http.Request)
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSON(w, http.StatusOK, toEngagementView(e))
+}
+
+type setOffensiveRoERequest struct {
+	CustomerContact   string `json:"customer_contact"`
+	EmergencyContact  string `json:"emergency_contact"`
+	RiskCeiling       string `json:"risk_ceiling"` // low|medium|high|prohibited, or empty to leave unset
+	ExclusionsChecked bool   `json:"exclusions_checked"`
+}
+
+// setOffensiveRoE records the offensive rules of engagement the governance policy requires before
+// adversary emulation or exploitation chains may run for this engagement.
+func (rt *Router) setOffensiveRoE(w http.ResponseWriter, r *http.Request) {
+	var req setOffensiveRoERequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid json body"})
+		return
+	}
+	e, err := rt.eng.SetOffensiveRoE(r.Context(), PrincipalFrom(r.Context()), shared.ID(TenantFrom(r.Context())),
+		shared.ID(r.PathValue("id")), req.CustomerContact, req.EmergencyContact, req.RiskCeiling, req.ExclusionsChecked)
+	if err != nil {
+		writeError(w, rt.log, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toEngagementView(e))
 }
 
 type transitionRequest struct {
@@ -304,7 +388,7 @@ func (rt *Router) transitionEngagement(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSON(w, http.StatusOK, toEngagementView(e))
 }
 
 type blackoutDTO struct {
@@ -335,7 +419,7 @@ func (rt *Router) setLiveRecon(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSON(w, http.StatusOK, toEngagementView(e))
 }
 
 // setRoE replaces the engagement's rules of engagement. The execution gate
@@ -368,5 +452,5 @@ func (rt *Router) setRoE(w http.ResponseWriter, r *http.Request) {
 		writeError(w, rt.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSON(w, http.StatusOK, toEngagementView(e))
 }

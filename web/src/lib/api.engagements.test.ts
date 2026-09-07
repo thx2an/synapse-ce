@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from './api'
 
+// Shape from `engagementView` in internal/adapter/httpapi/resource_view.go.
 const engagementWire = {
-  ID: 'eng-upload',
-  Name: 'Uploaded assessment',
-  Status: 'draft',
-  Scope: { InScope: [], OutOfScope: [] },
+  id: 'eng-upload',
+  name: 'Uploaded assessment',
+  status: 'draft',
+  scope: { in_scope: [], out_of_scope: [] },
 }
 
 describe('Engagements API', () => {
@@ -57,4 +58,40 @@ describe('Engagements API', () => {
     })
     expect(fetchSpy.mock.calls[0][0]).toBe('/api/v1/engagements/eng%20upload/source')
   })
+
+  it('runEmulation posts the target and maps the tag-less run summary defensively', async () => {
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        run: { ID: 'emu-1', Target: 'asset-1', Coverage: [{ TechniqueID: 'T1', Executed: true }, { TechniqueID: 'T2', Executed: false }] },
+        coverage: { Coverage: [], Bonus: [], Gaps: [] },
+      }),
+    } as Response)
+    const res = await api.runEmulation('eng-1', 'asset-1')
+    expect(res).toEqual({ runId: 'emu-1', techniques: 2, executed: 1 })
+    const [, opts] = fetchSpy.mock.calls[0] as [string, RequestInit]
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body as string)).toEqual({ target: 'asset-1' })
+  })
+
+
+  it('rehearseChain posts snake-cased steps and maps the result', async () => {
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ chain_id: 'chain-1', state: 'succeeded', steps: 2, simulated: true }),
+    } as Response)
+    const res = await api.rehearseChain('eng-1', [
+      { technique: 'recon.service_banner', target: 'asset-1', blastRadius: 'read_only' },
+      { technique: 'x.state', target: 'asset-2', blastRadius: 'state_changing', cleanup: ['undo'], cleanupVerification: 'check' },
+    ])
+    expect(res).toEqual({ chainId: 'chain-1', state: 'succeeded', steps: 2, simulated: true })
+    const [, opts] = fetchSpy.mock.calls[0] as [string, RequestInit]
+    expect(opts.method).toBe('POST')
+    const sent = JSON.parse(opts.body as string)
+    expect(sent.steps[0]).toEqual({ technique: 'recon.service_banner', target: 'asset-1', blast_radius: 'read_only', cleanup: [], cleanup_verification: '' })
+    expect(sent.steps[1]).toEqual({ technique: 'x.state', target: 'asset-2', blast_radius: 'state_changing', cleanup: ['undo'], cleanup_verification: 'check' })
+  })
+
 })

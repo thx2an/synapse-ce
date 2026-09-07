@@ -27,7 +27,7 @@ func TestAttackPathStoreRejectsMismatchedBatchAtomically(t *testing.T) {
 		t.Skip("set SYNAPSE_TEST_DB_DSN to run the postgres integration test")
 	}
 	ctx := context.Background()
-	if err := Migrate(ctx, dsn); err != nil {
+	if err := MigrateLocked(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := Connect(ctx, dsn)
@@ -92,7 +92,7 @@ func TestAttackPathStoreReplaceBindingsSerializesProducer(t *testing.T) {
 		t.Skip("set SYNAPSE_TEST_DB_DSN to run the postgres integration test")
 	}
 	ctx := context.Background()
-	if err := Migrate(ctx, dsn); err != nil {
+	if err := MigrateLocked(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := Connect(ctx, dsn)
@@ -193,18 +193,15 @@ func TestMigration0069DownDeduplicatesProducers(t *testing.T) {
 		t.Skip("set SYNAPSE_TEST_DB_DSN to run the postgres integration test")
 	}
 	ctx := context.Background()
-	if err := Migrate(ctx, dsn); err != nil {
+	if err := MigrateLocked(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := Migrate(context.Background(), dsn); err != nil {
+		if err := MigrateLocked(context.Background(), dsn); err != nil {
 			t.Errorf("restore migrations: %v", err)
 		}
 	})
-	db, err := goose.OpenDBWithDriver("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openLockedGooseDB(t, dsn)
 	defer db.Close()
 	goose.SetBaseFS(migrations.FS)
 	if err := goose.SetDialect("postgres"); err != nil {
@@ -253,9 +250,20 @@ func seedAttackPathTargets(t *testing.T, pool *pgxpool.Pool, tenant, engagementI
 	// httpapi/auth.go and the worker do.
 	ctx := shared.WithTenant(context.Background(), tenant)
 	now := time.Now().UTC()
-	eng, _ := engagement.New(engagementID, tenant, "eng", "client", now)
-	if err := NewEngagementRepository(pool).Create(ctx, eng); err != nil {
-		t.Fatal(err)
+	if legacyFindingSchema {
+		// The schema is rolled back below the columns the repository writes (host_asset_id arrived in
+		// 0130), so seed the engagement with the columns every version since 0001 has.
+		if err := WithTenant(ctx, pool, tenant.String(), func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `INSERT INTO engagements (id, tenant_id, name, client, status, created_at, updated_at) VALUES ($1,$2,'eng','client','draft',$3,$3)`, engagementID.String(), tenant.String(), now)
+			return err
+		}); err != nil {
+			t.Fatalf("insert engagement: %v", err)
+		}
+	} else {
+		eng, _ := engagement.New(engagementID, tenant, "eng", "client", now)
+		if err := NewEngagementRepository(pool).Create(ctx, eng); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for i := range assets {
 		a, _ := asset.New(assets[i], tenant, asset.KindImage, fmt.Sprintf("sha256:%s-%d", suffix, i), "image", nil, now)

@@ -100,6 +100,47 @@ The cluster agent requires `SYNAPSE_CLUSTER` as a stable identity keyed into eve
 `SYNAPSE_CLUSTER_NAMESPACES` to narrow scope and `SYNAPSE_CLUSTER_RESYNC` (default `5m`) to set the
 collection interval.
 
+## Host vulnerabilities
+
+A host agent reports the installed OS packages (dpkg, apk, rpm) with distro-qualified package URLs in
+every inventory snapshot. The control plane records that list as the host's SBOM in a hidden per-host
+engagement (the fleet twin of a Project's analysis context) and runs the SCA imported-SBOM pipeline
+against it: the same advisory sources, OS version comparison, severity backfill, KEV/EPSS risk
+ranking and deduplication a repository or image scan gets. Findings are re-evaluated by the
+vulnerability reconciliation job when advisories change, so a host that never changes still picks up
+new CVEs.
+
+Recording is idempotent per package set. An unchanged host does not re-import or re-scan on its next
+sweep; a changed set is recorded once the previous scan has finished, and at most once per ten
+minutes per host. An inventory above 50,000 packages is refused, and one agent identity may create at
+most 16 host assets (a reimaged machine gets a new machine id; an agent varying its facts does not get
+unbounded hosts, contexts and scans). The cap is checked before the write and enforced again inside
+it: a `fleet_assets` trigger (migration 0132) serialises new host rows per agent and refuses the row
+past the cap, so two syncs racing past the first check cannot both create a host. A refusal is audited
+as `host_inventory.host_cap_reached` and returned as 403. The `POST /api/v1/fleet/inventory/host` response carries a
+`vulnerability_scan` object with the outcome (`engagement_id`, `job_id`, `components`, or `skipped`
+with a `reason`). A scan-pipeline failure is audited as `host_inventory.vulnerability_scan_failed` and
+reported in that object; it never fails the inventory sync itself. The host asset's attributes carry the
+coverage gaps the agent declared (`coverage_gaps`, `coverage_gap_kinds`, `coverage_gap_details`), and
+the host page's Coverage gaps tab lists them with what each one means for the findings.
+
+The VM agent also reports its running processes on the inventory-sweep cadence
+(`POST /api/v1/fleet/processes`, read-only procfs: pid, comm, exe path). The control plane resolves the
+host asset from the authenticated agent, stores the running-process projection, and folds the profile
+into the asset's behavior baseline (#594 D), so the statistical baseline that scores a host's Behavior
+risk factor finally has input. Set `SYNAPSE_PROCESS_REPORT_ENABLED=false` to disable it. The advisory-revision reconciler
+visits host contexts alongside projects, so a host whose packages never change still gains a finding
+when a new advisory names one of them.
+
+```
+GET /api/v1/assets/hosts                          every host with its vulnerability summary
+GET /api/v1/assets/{assetID}/vulnerabilities      one host: packages, latest scan, findings
+```
+
+The console lists hosts under Fleet, Hosts, worst first, and opens each host to its findings with
+package, installed and fixed version, severity, CVSS and KEV. The hidden context does not appear in
+the engagement list and is not reachable through the engagement routes.
+
 ## Detections
 
 ```bash
@@ -132,6 +173,18 @@ complete 2xx response, and per-epoch ACK history lets a reboot finish committing
 records were already reclaimed. Keys rotate before expiry, and one `403` causes one new key registration
 plus a retry of the same pending sequence. A second rejection stops that delivery lane instead of
 generating keys indefinitely; the raw telemetry and durable-gap workers remain independent.
+
+### Rate rules
+
+A rule matches per event or per burst. A windowed rule (`Window{Count, Within, GroupBy}`) counts the
+events its predicates match inside a sliding span, partitioned by the grouped fields, and fires once when
+the count is reached; the detection carries the burst as evidence (the last 64 events when it is longer)
+and the count restarts. `det.suspicious_dns_beacon` v2 is the first: 120 outbound DNS datagrams to one
+destination inside a minute, grouped by `net.remote_addr`. v1 fired on every DNS packet, which is name
+resolution, not beaconing. The same evaluator replays stored telemetry in retro hunts and release
+evidence, so a windowed rule fires on the same bursts offline as it does live. Per rule the evaluator
+tracks at most 1024 groups and evicts the stalest, so a sensor's memory stays bounded whatever an
+attacker varies.
 
 ### Durable telemetry spool
 
@@ -169,6 +222,38 @@ by default and has no authentication. Exported series have bounded labels (prior
 - `synapse_agent_spool_corruption_events_total`
 - `synapse_agent_spool_fsync_total` and `synapse_agent_spool_fsync_duration_seconds_total`
 
+## Alerting
+
+Set `SYNAPSE_ALERT_WEBHOOK_URL` and the control plane posts a signed JSON alert to that URL every time
+correlation opens an incident. Correlation itself runs after every detection batch that seals new
+detections, off the agent's request, one run per engagement at a time (batches that arrive during a run
+are folded into a single rerun), and on demand through `POST /api/v1/fleet/engagements/{id}/correlate`;
+detections completed later by provenance reconciliation are correlated the same way. So with
+`SYNAPSE_FLEET_DETECTION_INGEST_ENABLED`, `SYNAPSE_FLEET_CORRELATION_ENABLED` and a webhook set, a
+detection on an agent becomes an incident and a notification without anyone calling an endpoint.
+
+```bash
+SYNAPSE_ALERT_WEBHOOK_URL=https://hooks.example.com/synapse
+SYNAPSE_ALERT_WEBHOOK_SECRET=$(openssl rand -hex 24)     # optional; >= 16 bytes
+SYNAPSE_ALERT_MIN_SEVERITY=medium                        # critical | high | medium | low | info
+```
+
+The body is `{"type": "incident.created", "sent_at": ..., "alert": {...}}` with the incident id, asset,
+engagement, severity, title, a short summary and a console link (`/fleet/incidents/{id}`). It carries no
+raw telemetry. With a secret set, `X-Synapse-Signature` is `sha256=<hex HMAC-SHA256>` over
+`<X-Synapse-Timestamp>.<body>`; verify it and reject stale timestamps. Transient failures (network, 429,
+5xx) are retried three times; a 4xx is final. Every attempt is audited as `alert.delivered` or
+`alert.failed` with the sink and the error (the error never carries the webhook URL, whose path is the
+credential for many chat hooks), so a missed page is in the audit log. Delivery runs on a bounded
+worker set off the ingest path, so a slow receiver never holds an agent's request. A tenant is limited
+to 60 delivered alerts per minute; the excess is audited as `alert.suppressed`, and a full queue as
+`alert.dropped`. Delivery never blocks or rolls back the incident it reports.
+
+`POST /api/v1/alerts/test` (administer) sends an `alert.test` alert that bypasses the severity floor and
+returns how many sinks acknowledged it; use it after configuring the receiver. The webhook client refuses
+private and link-local destinations unless `SYNAPSE_ALERT_WEBHOOK_ALLOW_PRIVATE=true`; `http` is accepted
+only for a loopback receiver in development.
+
 ## Coverage
 
 ```
@@ -197,6 +282,18 @@ that declines work records `refused` rather than failing quietly. Bound server-s
 
 Response actions are governed, reversible, and audited. They run through the same scope and authorization
 enforcement as any other execution.
+
+Wire the routes and a defender can drive the full loop: `POST /api/v1/blueteam/engagements/{id}/response/plan`
+dry-runs an action (isolate_host, quarantine_file, stop_process) and its mandatory reversal and executes
+nothing; `.../response/apply` applies it through the shared admission gate (server-side scope
+authorization, a recorded human approver, a blast-radius check on the executed effect); `POST
+/api/v1/blueteam/response/{id}/revert` reverses it; `GET /api/v1/blueteam/response` lists the
+admitted-but-not-applied set the kill switch cancels. The action id is server-minted, and a second-approval
+requirement answers 202. The default executor records the full admission -> approval -> apply -> verify ->
+revert ledger without touching a host; a real host executor is a deliberate, review-gated extension point
+(`internal/usecase/response/simulation.go`), so applying a real isolation still requires an explicit
+execution-safety decision the platform does not make on its own. The `POST /api/v1/redteam/halt` kill switch
+now cancels pending response actions as a fourth layer, so one operator action stops the whole estate.
 
 ## Rollout and upgrades
 

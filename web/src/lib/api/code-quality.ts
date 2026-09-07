@@ -37,6 +37,7 @@ import type {
 import { mapProjectOverviewResponse, type ProjectOverview } from '../projectOverview'
 import { mapProjectMeasureResponse, type MeasuresQuery, type ProjectMeasureResponse } from '../projectMeasures'
 import { ApiError, blobDownload, getToken, getOnUnauthorized, req } from './client'
+import type { ProjectWire } from './wire'
 import { mapScanJob, mapCodeQualityReport } from './scan'
 
 function mapQualityProfile(r: any): QualityProfile {
@@ -63,19 +64,21 @@ function mapQualityGate(r: any): QualityGate {
   }
 }
 
-function mapProject(r: any): Project {
+// The wire shape is `projectView` in internal/adapter/httpapi/resource_view.go, plus the two
+// list-only enrichments `projectSummaryResponse` adds. See ./wire.ts.
+function mapProject(r: ProjectWire): Project {
   return {
-    id: r.ID ?? '',
-    name: r.Name ?? '',
-    key: r.Key ?? '',
+    id: r.id ?? '',
+    name: r.name ?? '',
+    key: r.key ?? '',
     sourceBinding: {
-      kind: r.SourceBinding?.kind ?? 'local',
-      value: r.SourceBinding?.value ?? '',
-      ref: r.SourceBinding?.ref ?? '',
+      kind: (r.source_binding?.kind ?? 'local') as Project['sourceBinding']['kind'],
+      value: r.source_binding?.value ?? '',
+      ref: r.source_binding?.ref ?? '',
     },
-    defaultProfileByLang: r.DefaultProfileByLang ?? {},
-    gateId: r.GateID ?? '',
-    createdAt: r.Audit?.CreatedAt ?? null,
+    defaultProfileByLang: r.default_profile_by_lang ?? {},
+    gateId: r.gate_id ?? '',
+    createdAt: r.created_at ?? null,
     latestAnalysis: r.latest_analysis ? mapProjectSummaryAnalysis(r.latest_analysis) : null,
     latestJob: r.latest_job ? mapScanJob(r.latest_job) : null,
   }
@@ -84,7 +87,7 @@ function mapProject(r: any): Project {
 function mapProjectSummaryAnalysis(r: any): ProjectAnalysis {
   const counts = (value: any) => ({ total: value?.total ?? 0, byKind: value?.by_kind ?? {}, bySeverity: value?.by_severity ?? {}, byStatus: value?.by_status ?? {} })
   const grade = (value: any): CodeRating => ({ security: (value?.security ?? '?') as CodeRating['security'], reliability: (value?.reliability ?? '?') as CodeRating['reliability'], maintainability: (value?.maintainability ?? '?') as CodeRating['maintainability'], techDebtMinutes: 0, debtRatioPct: 0, linesOfCode: 0 })
-  return { id: r.id ?? '', createdAt: r.created_at ?? '', sourceRef: '', sourceCommit: r.source_commit ?? '', gate: { passed: r.gate_passed ?? false, results: [] }, gateInfo: { key: r.gate_info?.key ?? '', name: r.gate_info?.name ?? 'Quality gate', source: r.gate_info?.source ?? '' }, issues: counts(r.issues), newCode: { previousId: '', counts: { ...counts(null), total: r.new_issues ?? 0 }, rating: { security: '?', reliability: '?', maintainability: null } }, delta: null, measures: {}, coverage: null, duplication: { blocks: [], duplicatedLines: 0, totalLines: 0, files: 0 }, rating: grade(r.rating) }
+  return { id: r.id ?? '', createdAt: r.created_at ?? '', origin: r.origin === 'ci' ? 'ci' : 'server', ci: null, sourceRef: '', sourceCommit: r.source_commit ?? '', gate: { passed: r.gate_passed ?? false, results: [] }, gateInfo: { key: r.gate_info?.key ?? '', name: r.gate_info?.name ?? 'Quality gate', source: r.gate_info?.source ?? '' }, issues: counts(r.issues), newCode: { previousId: '', counts: { ...counts(null), total: r.new_issues ?? 0 }, rating: { security: '?', reliability: '?', maintainability: null } }, delta: null, measures: {}, coverage: null, duplication: { blocks: [], duplicatedLines: 0, totalLines: 0, files: 0 }, rating: grade(r.rating) }
 }
 
 function mapProjectAnalysis(r: any): ProjectAnalysis {
@@ -94,8 +97,12 @@ function mapProjectAnalysis(r: any): ProjectAnalysis {
     maintainability: (value?.maintainability ?? '?') as CodeRating['maintainability'], techDebtMinutes: value?.tech_debt_minutes ?? 0,
     debtRatioPct: value?.debt_ratio_pct ?? 0, linesOfCode: value?.lines_of_code ?? 0,
   })
+  const origin: ProjectAnalysis['origin'] = r.origin === 'ci' ? 'ci' : 'server'
+  const ci: ProjectAnalysis['ci'] = r.ci
+    ? { provider: r.ci.provider ?? '', runUrl: r.ci.run_url ?? '', runId: r.ci.run_id ?? '', branch: r.ci.branch ?? '', actor: r.ci.actor ?? '' }
+    : null
   return {
-    id: r.id ?? '', createdAt: r.created_at ?? '', sourceRef: r.source_ref ?? '', sourceCommit: r.source_commit ?? '',
+    id: r.id ?? '', createdAt: r.created_at ?? '', origin, ci, sourceRef: r.source_ref ?? '', sourceCommit: r.source_commit ?? '',
     gate: { passed: r.gate?.passed ?? false, results: (r.gate?.results ?? []).map((result: any) => ({ condition: { metric: result.metric ?? '', op: result.op ?? '', threshold: result.threshold ?? 0 }, actual: result.actual ?? 0, passed: result.passed ?? false })) },
     gateInfo: { key: r.gate_info?.key ?? '', name: r.gate_info?.name ?? 'Quality gate', source: r.gate_info?.source ?? '' },
     issues: counts(r.issues), newCode: { previousId: r.new_code?.previous_id ?? '', counts: counts(r.new_code?.counts), rating: { security: (r.new_code?.rating?.security ?? '?') as Grade, reliability: (r.new_code?.rating?.reliability ?? '?') as Grade, maintainability: r.new_code?.rating?.maintainability ? r.new_code.rating.maintainability as Grade : null } },
@@ -445,8 +452,14 @@ export const codeQualityApi = {
   getProject: async (key: string): Promise<Project> =>
     mapProject(await req(`/projects/${encodeURIComponent(key)}`)),
 
-  projectOverview: async (key: string): Promise<ProjectOverview> =>
-    mapProjectOverviewResponse(await req(`/projects/${encodeURIComponent(key)}/overview`)),
+  projectOverview: async (key: string, branch = ''): Promise<ProjectOverview> =>
+    mapProjectOverviewResponse(await req(`/projects/${encodeURIComponent(key)}/overview${branch ? `?branch=${encodeURIComponent(branch)}` : ''}`)),
+
+  /** The distinct branches this project has recorded analyses on, sorted; empty when never analyzed. */
+  projectBranches: async (key: string): Promise<string[]> => {
+    const r = await req(`/projects/${encodeURIComponent(key)}/branches`)
+    return Array.isArray(r?.branches) ? r.branches.filter((b: unknown): b is string => typeof b === 'string') : []
+  },
 
   projectDependencyGraph: async (key: string, signal?: AbortSignal): Promise<ProjectDependencyGraph> =>
     mapProjectDependencyGraph(await req(`/projects/${encodeURIComponent(key)}/dependency-graph`, { signal })),
@@ -585,8 +598,9 @@ export const codeQualityApi = {
     return mapScanJob(await res.json())
   },
 
-  projectAnalyses: async (key: string, cursor: ProjectAnalysisCursor | null = null): Promise<ProjectAnalysisPage> => {
+  projectAnalyses: async (key: string, cursor: ProjectAnalysisCursor | null = null, branch = ''): Promise<ProjectAnalysisPage> => {
     const query = new URLSearchParams({ limit: '25' })
+    if (branch) query.set('branch', branch)
     if (cursor) {
       query.set('before_created_at', cursor.beforeCreatedAt)
       query.set('before_id', cursor.beforeId)

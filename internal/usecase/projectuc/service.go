@@ -9,6 +9,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ type Service struct {
 	ids                              ports.IDGenerator
 	audit                            ports.AuditLogger
 	scanner                          *scauc.Service
+	jobs                             ports.ScanJobStore
 	archives                         ports.ProjectArchiveStore
 	sourceArtifacts                  ports.ProjectSourceArtifactStore
 	analyses                         ports.ProjectAnalysisStore
@@ -56,7 +58,11 @@ func NewService(repo ports.ProjectRepository, engagements ports.EngagementReposi
 	return &Service{repo: repo, engagements: engagements, clock: clock, ids: ids, audit: audit, allowLocalSource: allowLocalSource}
 }
 
-func (s *Service) SetScanner(scanner *scauc.Service)               { s.scanner = scanner }
+func (s *Service) SetScanner(scanner *scauc.Service) { s.scanner = scanner }
+
+// SetScanJobs lets an imported analysis leave a scan-job record behind, so the project's analysis
+// status and its job history show the CI run the same way they show a server run.
+func (s *Service) SetScanJobs(jobs ports.ScanJobStore)             { s.jobs = jobs }
 func (s *Service) SetArchiveStore(store ports.ProjectArchiveStore) { s.archives = store }
 func (s *Service) SetSourceArtifactStore(store ports.ProjectSourceArtifactStore) {
 	s.sourceArtifacts = store
@@ -336,7 +342,9 @@ func (s *Service) projectAcquireRequest(ctx context.Context, p *project.Project)
 	if p.SourceBinding.Ref == "" || s.analyses == nil {
 		return request, nil
 	}
-	previous, _, err := s.analyses.List(ctx, p.TenantID, p.ID, 1, time.Time{}, "")
+	// Diff against the previous analysis on the SAME branch. result.SourceRef, which becomes the
+	// stored branch, is this request's Ref, so the branch we key on here is p.SourceBinding.Ref.
+	previous, _, err := s.analyses.List(ctx, p.TenantID, p.ID, p.SourceBinding.Ref, 1, time.Time{}, "")
 	if err != nil {
 		return ports.AcquireRequest{}, fmt.Errorf("list comparison baseline: %w", err)
 	}
@@ -347,14 +355,19 @@ func (s *Service) projectAcquireRequest(ctx context.Context, p *project.Project)
 }
 
 func (s *Service) AnalysisStatus(ctx context.Context, tenantID shared.ID, key string) (ports.ScanJob, error) {
-	if s.scanner == nil {
+	if s.scanner == nil && s.jobs == nil {
 		return ports.ScanJob{}, shared.ErrNotFound
 	}
 	_, e, err := s.analysisContext(ctx, tenantID, key)
 	if err != nil {
 		return ports.ScanJob{}, err
 	}
-	return s.scanner.LatestJob(ctx, e.ID)
+	if s.scanner != nil {
+		return s.scanner.LatestJob(ctx, e.ID)
+	}
+	// No scanner is wired but a job store is: a deployment that only ever receives pipeline
+	// results still has a latest run to report.
+	return s.jobs.LatestForEngagement(ctx, e.ID)
 }
 
 type LatestAnalysis struct {
@@ -362,7 +375,9 @@ type LatestAnalysis struct {
 	Result   []byte
 }
 
-func (s *Service) LatestAnalysis(ctx context.Context, tenantID shared.ID, key string) (LatestAnalysis, error) {
+// LatestAnalysis returns the newest completed analysis. An empty branch means the latest across all
+// branches (the default); a non-empty branch restricts the result to that branch.
+func (s *Service) LatestAnalysis(ctx context.Context, tenantID shared.ID, key, branch string) (LatestAnalysis, error) {
 	if s.analyses == nil {
 		return LatestAnalysis{}, shared.ErrNotFound
 	}
@@ -370,15 +385,16 @@ func (s *Service) LatestAnalysis(ctx context.Context, tenantID shared.ID, key st
 	if err != nil {
 		return LatestAnalysis{}, err
 	}
-	analysis, result, err := s.analyses.LatestWithResult(ctx, tenantID, p.ID)
+	analysis, result, err := s.analyses.LatestWithResult(ctx, tenantID, p.ID, branch)
 	if err != nil {
 		return LatestAnalysis{}, err
 	}
 	return LatestAnalysis{Analysis: analysis, Result: result}, nil
 }
 
-// ListAnalyses returns one immutable Project history page, newest first.
-func (s *Service) ListAnalyses(ctx context.Context, tenantID shared.ID, key string, limit int, beforeCreatedAt time.Time, beforeID shared.ID) ([]projectanalysis.Analysis, bool, error) {
+// ListAnalyses returns one immutable Project history page, newest first. An empty branch means all
+// branches; a non-empty branch restricts the page to analyses produced on that branch.
+func (s *Service) ListAnalyses(ctx context.Context, tenantID shared.ID, key, branch string, limit int, beforeCreatedAt time.Time, beforeID shared.ID) ([]projectanalysis.Analysis, bool, error) {
 	if s.analyses == nil {
 		return nil, false, shared.ErrNotFound
 	}
@@ -386,7 +402,19 @@ func (s *Service) ListAnalyses(ctx context.Context, tenantID shared.ID, key stri
 	if err != nil {
 		return nil, false, err
 	}
-	return s.analyses.List(ctx, tenantID, p.ID, limit, beforeCreatedAt, beforeID)
+	return s.analyses.List(ctx, tenantID, p.ID, branch, limit, beforeCreatedAt, beforeID)
+}
+
+// Branches returns the distinct branch values recorded for the Project, sorted.
+func (s *Service) Branches(ctx context.Context, tenantID shared.ID, key string) ([]string, error) {
+	if s.analyses == nil {
+		return nil, shared.ErrNotFound
+	}
+	p, err := s.Get(ctx, tenantID, key)
+	if err != nil {
+		return nil, err
+	}
+	return s.analyses.Branches(ctx, tenantID, p.ID)
 }
 
 // GetAnalysis returns one snapshot without disclosing another Project's history.
@@ -403,7 +431,109 @@ func (s *Service) GetAnalysis(ctx context.Context, tenantID shared.ID, key, id s
 
 // RecordProjectAnalysis is called by SCA only after a successful pipeline and
 // before its ScanJob becomes succeeded. Non-Project scans intentionally no-op.
-func (s *Service) RecordProjectAnalysis(ctx context.Context, engagementID shared.ID, jobID string, completedAt time.Time, result *scauc.ScanResult) (recordErr error) {
+func (s *Service) RecordProjectAnalysis(ctx context.Context, engagementID shared.ID, jobID string, completedAt time.Time, result *scauc.ScanResult) error {
+	return s.recordProjectAnalysis(ctx, engagementID, jobID, completedAt, result, projectanalysis.OriginServer, nil)
+}
+
+// ImportAnalysisInput is a scan result a pipeline produced with synapse-cli and is handing to the
+// server to record as this project's next analysis.
+type ImportAnalysisInput struct {
+	Actor  string
+	CI     projectanalysis.CIContext
+	Result *scauc.ScanResult
+}
+
+// ImportAnalysis records a pipeline-produced scan result as an immutable project analysis.
+//
+// This is the join the product lacked: synapse-cli was a self-contained gate whose result died with
+// the process, and the console was fed only by scans the server ran itself. Everything after the
+// scan is shared with the server path, on purpose. The same recorder builds the same aggregate, so
+// the analysis takes its place in the history, moves the trend, evaluates the project's managed
+// quality gate, and carries ratings, issues and hotspots exactly as a server analysis would. The
+// only things that differ are what the pipeline is trusted to say: the source is the pipeline's
+// checkout and the branch and commit are the pipeline's claim, which is why the analysis is marked
+// OriginCI and carries the CI context for the reader to see.
+//
+// The gate is deliberately NOT taken from the payload. The project's managed gate is the server's
+// policy, and a pipeline that could ship its own gate definition could ship a passing one.
+func (s *Service) ImportAnalysis(ctx context.Context, tenantID shared.ID, key string, in ImportAnalysisInput) (projectanalysis.Analysis, error) {
+	if err := requireActor(in.Actor); err != nil {
+		return projectanalysis.Analysis{}, err
+	}
+	if in.Result == nil {
+		return projectanalysis.Analysis{}, fmt.Errorf("%w: a scan result is required", shared.ErrValidation)
+	}
+	if s.analyses == nil {
+		return projectanalysis.Analysis{}, fmt.Errorf("%w: project analysis is not configured", shared.ErrValidation)
+	}
+	ci, err := in.CI.Normalize()
+	if err != nil {
+		return projectanalysis.Analysis{}, fmt.Errorf("%w: %v", shared.ErrValidation, err)
+	}
+	p, e, err := s.analysisContext(ctx, tenantID, key)
+	if err != nil {
+		return projectanalysis.Analysis{}, err
+	}
+
+	result := *in.Result
+	// The pipeline's branch and commit stand in for what the server would have resolved from its
+	// own clone. They are claims, and the analysis says so through its origin.
+	if result.SourceRef == "" {
+		result.SourceRef = ci.Branch
+	}
+	result.Gate = qualitygate.Gate{} // the server's managed gate decides, never the payload's
+	now := s.clock.Now().UTC()
+	jobID := s.ids.NewID().String()
+
+	// Leave a scan-job record so the project's analysis status and job history reflect this run.
+	// It is recorded as already succeeded: the work happened in the pipeline, not here.
+	var job ports.ScanJob
+	if s.jobs != nil {
+		finished := now
+		job = ports.ScanJob{
+			ID: jobID, EngagementID: e.ID.String(), Target: result.Target, Kind: "ci-import",
+			Status: ports.ScanSucceeded, Stage: "imported", Progress: 100,
+			StartedAt: now, FinishedAt: &finished, DebugEvents: []ports.ScanDebugEvent{},
+		}
+		if err := s.jobs.CreateRunning(ctx, job); err != nil {
+			return projectanalysis.Analysis{}, fmt.Errorf("record imported scan job: %w", err)
+		}
+	}
+
+	var ciPtr *projectanalysis.CIContext
+	if !ci.Empty() {
+		ciPtr = &ci
+	}
+	if err := s.recordProjectAnalysis(ctx, e.ID, jobID, now, &result, projectanalysis.OriginCI, ciPtr); err != nil {
+		// The job row exists so the history shows the run. A rejected result (a payload the
+		// recorder refuses) must not leave it reading as a success with no analysis behind it.
+		if s.jobs != nil {
+			job.Status, job.Stage, job.Error = ports.ScanFailed, "import-rejected", err.Error()
+			if saveErr := s.jobs.Save(ctx, job); saveErr != nil {
+				return projectanalysis.Analysis{}, errors.Join(err, fmt.Errorf("mark imported scan job failed: %w", saveErr))
+			}
+		}
+		return projectanalysis.Analysis{}, err
+	}
+	if s.audit != nil {
+		if err := s.audit.Record(ctx, ports.AuditEntry{
+			Actor: in.Actor, Action: "project.analysis.imported", Target: p.ID.String(),
+			Metadata: map[string]string{
+				"project_key": p.Key, "analysis_id": jobID, "origin": string(projectanalysis.OriginCI),
+				"ci_provider": ci.Provider, "ci_branch": ci.Branch, "ci_run_url": ci.RunURL,
+				"findings": strconv.Itoa(len(result.Findings)),
+			},
+			At: now,
+		}); err != nil {
+			return projectanalysis.Analysis{}, fmt.Errorf("audit imported analysis: %w", err)
+		}
+	}
+	return s.analyses.Get(ctx, tenantID, p.ID, shared.ID(jobID))
+}
+
+// recordProjectAnalysis is the shared recorder behind a server scan and a pipeline import. origin
+// and ci are the only things the two callers supply differently.
+func (s *Service) recordProjectAnalysis(ctx context.Context, engagementID shared.ID, jobID string, completedAt time.Time, result *scauc.ScanResult, origin projectanalysis.Origin, ci *projectanalysis.CIContext) (recordErr error) {
 	if result == nil {
 		return fmt.Errorf("project analysis result is required")
 	}
@@ -425,14 +555,19 @@ func (s *Service) RecordProjectAnalysis(ctx context.Context, engagementID shared
 		if recordErr == nil || s.sourceArtifacts == nil {
 			return
 		}
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), s.completionTimeout())
+		// WithoutCancel, not Background: the compensation must survive the request being canceled
+		// AND keep the ctx values, because the analysis store is tenant-scoped now.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.completionTimeout())
 		defer cancel()
 		if _, err := s.analyses.Get(cleanupCtx, p.TenantID, p.ID, shared.ID(jobID)); err == nil || !errors.Is(err, shared.ErrNotFound) {
 			return
 		}
 		_ = s.sourceArtifacts.DeleteAnalysis(cleanupCtx, p.TenantID, p.ID, jobID)
 	}()
-	previous, _, err := s.analyses.List(ctx, p.TenantID, p.ID, 1, time.Time{}, "")
+	// The New-Code baseline is the previous analysis on the SAME branch as the one being recorded,
+	// so a feature branch diffs against its own history, not whichever branch scanned last.
+	recordingBranch := projectanalysis.Analysis{SourceRef: result.SourceRef, CI: ci}.Branch()
+	previous, _, err := s.analyses.List(ctx, p.TenantID, p.ID, recordingBranch, 1, time.Time{}, "")
 	if err != nil {
 		return fmt.Errorf("list project analyses: %w", err)
 	}
@@ -669,6 +804,7 @@ func (s *Service) RecordProjectAnalysis(ctx context.Context, engagementID shared
 	annotations := buildAnnotationsWithCatalog(ctx, detection, baseline, s.ruleCatalog)
 	analysis, err := projectanalysis.Build(projectanalysis.Input{
 		ID: jobID, TenantID: p.TenantID, ProjectID: p.ID, ProjectKey: p.Key, CreatedAt: completedAt,
+		Origin: origin, CI: ci,
 		SourceRef: result.SourceRef, SourceCommit: result.SourceCommit,
 		SourceRevision: projectanalysis.SourceRevision{Kind: projectScanKind(p.SourceBinding.Kind), Head: result.SourceCommit, Base: comparison.BaseCommit, MergeBase: comparison.MergeBase, AnalysisID: jobID},
 		Capabilities:   capabilities, SourceManifest: manifest, Comparison: comparison, FileChanges: result.FileChanges, Annotations: annotations,

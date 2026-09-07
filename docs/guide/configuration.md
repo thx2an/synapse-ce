@@ -10,6 +10,25 @@ A fully documented template lives in [`.env.example`](https://github.com/KKloudT
 Conventions: an empty value means unset, so the built-in default applies. Booleans accept
 `1/0/true/false`. Durations use Go syntax such as `30s`, `10m`, `1h`. Sizes are byte counts.
 
+## Reading the enabled set back
+
+`GET /api/v1/capabilities` reports, for every optional subsystem, a stable key, a human name,
+whether this deployment enables it, and the `SYNAPSE_*` variable that controls it:
+
+```json
+{"capabilities": [
+  {"key": "fleet", "name": "Agent fleet transport", "enabled": false, "switch": "SYNAPSE_FLEET_ENABLED"},
+  {"key": "cspm", "name": "Cloud security posture management", "enabled": false,
+   "switch": "SYNAPSE_CSPM_ENABLED", "requires": ["fleet_assets"]}
+]}
+```
+
+An optional subsystem registers its routes only when its switch is on, so a disabled subsystem and a
+broken one both answer `404`. Read this endpoint first and render a disabled subsystem as disabled.
+`requires` names the other capabilities a subsystem depends on, which is why an enabled switch can
+still report `enabled: false`. The response carries booleans and variable names, never a configured
+value. Any authenticated role may read it.
+
 ## Required
 
 | Variable | Default | Description |
@@ -171,7 +190,7 @@ Most of these ship ON by default (safe, best-effort). See [Features](features.md
 | `SYNAPSE_VERIFIER_MODEL` | `SYNAPSE_LLM_MODEL` | Must name a different canonical model family for AI gate exemptions. The verifier is blind to the proposer result. Provider/date aliases and Amazon Bedrock inference-profile IDs fail closed as the same family. Two-model consensus remains subject to high/critical, secret, and dangerous-CWE human-review floors. |
 | `SYNAPSE_FP_TRIAGE_INDEPENDENCE` | `model_family` | `model_family` requires different canonical model families. `provider` additionally requires different non-empty provider identities. Empty defaults to model-family compatibility; unknown values fail closed to advisory-only. |
 | `SYNAPSE_DETECTION_PRIORITY` | `comprehensive` | `comprehensive` reports every match. `precise` quarantines single-source, non-KEV findings into a needs-verify queue that is still reported and sealed but exempt from the `--fail-on` gate. |
-| `SYNAPSE_OFFLINE` | `false` | Skip the live advisory source and detect with the offline database only. |
+| `SYNAPSE_OFFLINE` | `false` | Run `synapse-cli scan` without network egress: detect with Grype's offline database only, and switch off every registry resolver (npm, composer, poetry, Bundler, Maven, Gradle), the Maven Central JAR SHA-1 lookup, KEV/EPSS, online NVD CVSS backfill, deps.dev and PyPI license metadata, and AI false-positive triage. Same as `--offline`. |
 | `SYNAPSE_IGNORE_UNFIXED` | `false` | Drop vulnerabilities that have no fixed version. |
 | `SYNAPSE_DB_MAX_AGE_DAYS` | `30` | Warn when a dated reference database (KEV, EPSS, or the Grype DB) is older than this many days. 0 disables the check. |
 | `SYNAPSE_SUPPRESSION_ENABLED` | `true` | Honor a `.synapseignore` file. Acceptance exempts only the `--fail-on` gate; the finding is still reported, persisted, and evidence-sealed. |
@@ -235,11 +254,16 @@ All off by default. The fleet needs PostgreSQL + `synapse-worker`; agents run on
 | `SYNAPSE_FLEET_TELEMETRY_INGEST_ENABLED` | `false` | Accept signed agent telemetry batches (A3, `POST /api/v1/fleet/telemetry`); verified + idempotently sequenced server-side. |
 | `SYNAPSE_FLEET_DETECTION_INGEST_ENABLED` | `false` | Accept signed agent detection batches (A4, `POST /api/v1/fleet/detections`); sealed once into the evidence chain. |
 | `SYNAPSE_FLEET_DETECTION_RECONCILE_INTERVAL` | `1m` | How often the tenant-scoped reconciler repairs pending attributed detections. |
-| `SYNAPSE_FLEET_CORRELATION_ENABLED` | `false` | Correlation orchestration (`POST /api/v1/fleet/engagements/{id}/correlate`): folds an engagement's sealed detections into incidents, auto-scoring each when tri-score is enabled. |
+| `SYNAPSE_FLEET_CORRELATION_ENABLED` | `false` | Correlation orchestration: folds an engagement's sealed detections into incidents, auto-scoring each when tri-score is enabled. Runs on every detection batch that seals new detections, and on demand through `POST /api/v1/fleet/engagements/{id}/correlate`. |
 | `SYNAPSE_FLEET_CORRELATION_WINDOW` | `30m` | Session gap for correlation — detections on one (asset, host) more than this apart start a new incident. |
 | `SYNAPSE_FLEET_CORRELATION_MAX_PER_INCIDENT` | `100` | Cap on detections one incident reflects individually before a storm is suppressed to a single note. |
 | `SYNAPSE_FLEET_KEY_REGISTRATION_ENABLED` | `false` | Serve agent signing-key registration (`POST /api/v1/fleet/keys`) + operator key list/revoke (A4, A0.2). |
 | `SYNAPSE_FLEET_STALE_AFTER` | `10m` | An agent older than this reads as stale (`<=0` disables the staleness view). |
+| `SYNAPSE_ALERT_WEBHOOK_URL` | (unset) | Enables operator alerting: each incident correlation opens is posted as signed JSON to this URL. `https` required, `http` only for a loopback host. `POST /api/v1/alerts/test` sends a test alert. |
+| `SYNAPSE_ALERT_WEBHOOK_SECRET` | (unset) | Signs each webhook body: `X-Synapse-Signature: sha256=<hex HMAC-SHA256 of "<X-Synapse-Timestamp>.<body>">`. At least 16 bytes when set. |
+| `SYNAPSE_ALERT_MIN_SEVERITY` | `medium` | Inclusive severity floor for delivered alerts (`critical`, `high`, `medium`, `low`, `info`). Test alerts always deliver. |
+| `SYNAPSE_ALERT_WEBHOOK_ALLOW_PRIVATE` | `false` | Let the webhook client dial private and link-local receivers. The SSRF guard refuses them otherwise. |
+| `SYNAPSE_ALERT_WEBHOOK_ALLOW_UNSIGNED` | `false` | Allow UNSIGNED alert delivery when no secret is set. Default false: a configured webhook requires `SYNAPSE_ALERT_WEBHOOK_SECRET` so a receiver can trust the alert is genuine. Set true only for a development receiver that does not verify the signature. |
 | `SYNAPSE_FLEET_COVERAGE_FRESHNESS_TARGET` | `24h` | Coverage freshness SLO. |
 | `SYNAPSE_FLEET_MIN_AGENT_VERSION` | empty | Reject agents below this version (empty = no floor). |
 | `SYNAPSE_FLEET_CA_CERT` / `_CA_KEY` / `_CERT_TTL` | empty | Enrolment PKI for agent client certificates (never logged). |
@@ -263,6 +287,7 @@ All off by default. The fleet needs PostgreSQL + `synapse-worker`; agents run on
 | `SYNAPSE_VULNERABILITY_SCHEDULER_MAX_QUEUE_DEPTH` | `100` | Stop dispatching when the vulnerability-sync queue reaches this depth. |
 | `SYNAPSE_VULNERABILITY_SCHEDULER_RECOVERY_LIMIT` | `10` | Maximum stale runs recovered per scheduler tick. |
 | `SYNAPSE_VULNERABILITY_PROVIDER_SYNC_ENABLED` | `false` | Permit provider sync execution. This global gate also blocks already queued runs after rollback. |
+| `SYNAPSE_VULNERABILITY_SOURCE_ALLOW_PRIVATE_NETWORK` | `false` | Permit a vulnerability source to reach RFC1918 addresses. A source is a URL the control plane fetches on a schedule, so leaving this off keeps whoever can write a source from probing the operator's own network. Loopback, link-local and carrier-grade NAT ranges stay blocked either way. |
 | `SYNAPSE_VULNERABILITY_OCCURRENCE_WRITES_ENABLED` | `false` | Permit tenant-scoped occurrence mutations for allowlisted tenants. |
 | `SYNAPSE_VULNERABILITY_FINDING_PROJECTION_ENABLED` | `false` | Permit machine-owned finding projection updates for allowlisted tenants. |
 | `SYNAPSE_VULNERABILITY_ACTIONS_ENABLED` | `false` | Permit risk-change action creation for allowlisted tenants. |
@@ -418,6 +443,7 @@ not operator settings and must not be injected manually.
 | `SYNAPSE_AGENT_QUEUE_DEPTH` | `256` | Pending agent-work queue depth. |
 | `SYNAPSE_AGENT_MAX_PARALLEL` | `1` | Maximum parallel actions per agent; serial by default. |
 | `SYNAPSE_AGENT_RECON_CONCURRENCY` | `3` | Recon work admitted within the agent budget. |
+| `SYNAPSE_DATA_DELETION_ENABLED` | `false` | Serve on-demand erasure (`DELETE /api/v1/fleet/engagements/{id}/detection-data`). Opt-in because the call drops an engagement's detection projection; the evidence chain survives, the request is legal-hold-checked, and the deletion is audited. Takes effect only when fleet detection ingest is enabled. |
 
 ### Host and Kubernetes agents
 
@@ -433,6 +459,8 @@ The following variables are read by `synapse-agent` and `synapse-cluster-agent`,
 | `SYNAPSE_AGENT_NAME` | hostname | Human-readable agent display name. |
 | `SYNAPSE_INVENTORY_SWEEP_ENABLED` | `true` | Ship host inventory continuously on a cadence (A8, #629), not only on a `scan.host` work order. Ingest is idempotent server-side (host upsert-by-natural-key), so a re-sweep of an unchanged host is a no-op. Set `false` to disable. |
 | `SYNAPSE_INVENTORY_SWEEP_INTERVAL` | `1h` | Cadence of the continuous host-inventory sweep. Clamped to a 1-minute floor so a misconfiguration cannot busy-loop the collector over the filesystem. |
+| `SYNAPSE_PROCESS_REPORT_ENABLED` | `true` | Report the host's running processes to the behavior baseline (#594 D) on the inventory-sweep cadence. Read-only procfs metadata (pid, comm, exe path); no process memory is read and nothing is executed. Set `false` to disable. |
+| `SYNAPSE_AGENT_PROC_ROOT` | `/proc` | Procfs root the agent enumerates running processes from. A host without procfs reports nothing. |
 | `SYNAPSE_DETECT_CLASSES` | empty | Comma-separated eBPF classes: `process`, `network`, `file`, `privilege`. Empty disables the engine; Linux root/capabilities are required. |
 | `SYNAPSE_DETECT_CPU_CEIL_PCT` | `0` | CPU ceiling for deterministic class shedding; zero disables shedding. |
 | `SYNAPSE_DETECTION_ENGAGEMENT_ID` | empty | Engagement receiving signed detection batches. Empty keeps confirmed detections durably local and does not start the remote detection shipper. |

@@ -73,6 +73,11 @@ var scalaExts = map[string]bool{".scala": true, ".sc": true}
 var rubyExts = map[string]bool{".rb": true, ".rake": true, ".ru": true, ".gemspec": true, ".erb": true}
 var vbExts = map[string]bool{".vb": true}
 var phpExts = map[string]bool{".php": true, ".phtml": true, ".inc": true, ".php5": true, ".module": true, ".phar": true}
+
+// jsxExts gate rules that only make sense in JSX/TSX markup. A plain .js file may contain a
+// `class = "..."` assignment that has nothing to do with a React prop.
+var jsxExts = map[string]bool{".jsx": true, ".tsx": true}
+
 var jsExts = map[string]bool{
 	".js": true, ".jsx": true, ".mjs": true, ".cjs": true,
 	".ts": true, ".tsx": true, ".mts": true, ".cts": true, // .mts/.cts are first-class TS ESM/CJS extensions
@@ -122,6 +127,76 @@ func safePathAccess(line string) bool {
 	return commentOnlyLine(line) || strings.Contains(l, "path.join(") || strings.Contains(l, "filepath.join(") || strings.Contains(l, "safejoin")
 }
 
+// skipJWTVerifyFlag drops the JWT-library `verify=False` keyword, which selects claim validation on
+// a decode call and has nothing to do with TLS certificate verification. PyJWT
+// `jwt.decode(token, verify=False)` is the canonical false positive for both TLS rules.
+func skipJWTVerifyFlag(line string) bool {
+	l := strings.ToLower(line)
+	if commentOnlyLine(line) {
+		return true
+	}
+	return strings.Contains(l, "jwt.decode(") || strings.Contains(l, "jwt.encode(") ||
+		strings.Contains(l, "jwt.verify(") || strings.Contains(l, "jose.decode(")
+}
+
+// skipGoTodoMarker keeps the TODO/FIXME debt marker off context.TODO(), which is the standard
+// placeholder context constructor, not unfinished work.
+func skipGoTodoMarker(line string) bool {
+	return strings.Contains(line, "context.TODO(") || strings.Contains(line, "ctx.TODO(")
+}
+
+// skipCommentOrPlaceholderSecret is the hardcoded-credential filter: obvious non-secrets plus plain
+// comment lines, where a credential-shaped mention is documentation rather than a leak.
+func skipCommentOrPlaceholderSecret(line string) bool {
+	return commentOnlyLine(line) || placeholderSecret(line)
+}
+
+// requestMarkerNoQuote is a request/user-controlled source cue that must be reachable WITHOUT
+// crossing a quote, so a word sitting inside a string literal can never stand in for one.
+const requestMarkerNoQuote = `[^;"'` + "\n" + `]*(?:req\.|request\.|params\[|\$_(?:GET|POST|REQUEST)|FormValue|URL\.Query|c\.(?:Query|Param)|getParameter)`
+
+// bareVariableArg is an ARGUMENT that is a bare variable: a value the reader cannot see, as opposed
+// to a literal the rule can prove constant. It also accepts the two wrappers that appear constantly
+// around such a value and that a plain identifier pattern used to miss:
+//
+//   - an index or slice, as in exec.Command(args[0], args[1:]...), where the BINARY itself is
+//     attacker-controlled, which is the strongest command-injection shape there is;
+//   - a []byte conversion, as in w.Write([]byte(s)), which is the idiomatic Go response write.
+//
+// A quoted literal still cannot match, because the first character after the wrapper must be an
+// identifier character rather than a quote.
+const bareVariableArg = `(?:\[\]byte\()?\s*[A-Za-z_$][\w$]*(?:\[[^\]` + "\n" + `]*\])?\s*(?:\.\.\.)?\s*\)?\s*[,)]`
+
+const bareFirstArg = `\s*` + bareVariableArg
+const bareLaterArg = `[^;` + "\n" + `]*,\s*` + bareVariableArg
+
+// shellBinaryArg matches a FIRST argument that names a shell. exec.Command builds an argv array and
+// spawns the program directly, with no shell to re-parse anything, so a variable in a later argument
+// is an ordinary parameter rather than an injection. A shell is the exception: everything after
+// `sh -c` is a program the shell parses, so a dynamic value there really is command injection.
+const shellBinaryArg = `\s*["'` + "`" + `](?:[a-z]:)?(?:[/\\](?:usr[/\\])?bin[/\\])?(?:sh|bash|zsh|ksh|dash|ash|busybox|cmd|cmd\.exe|powershell|powershell\.exe|pwsh)["'` + "`" + `]\s*,`
+
+// commandArgEvidence is what an exec.Command argument list must carry to be dynamic.
+//
+// A bare variable in a LATER argument is deliberately absent. `exec.Command("echo", in)` is the
+// SAFE way to pass untrusted input to a program, and the Contrast go-test-bench corpus labels it
+// exactly that way; reporting it cost precision on the one shape the rule most needs to get right.
+// What remains is the set of shapes that are actually dangerous: a variable BINARY, where the
+// attacker chooses the program; a shell binary with anything dynamic after it; a value built by
+// concatenation or Sprintf; and a request value reached without crossing a quote.
+const commandArgEvidence = `(?:` + requestMarkerNoQuote +
+	`|[^;` + "\n" + `]*fmt\.Sprintf` +
+	`|` + literalPlusVar +
+	`|` + shellBinaryArg + `[^;` + "\n" + `]*` + bareVariableArg +
+	`|` + bareFirstArg + `)`
+
+// literalPlusVar is string concatenation with a variable: a quoted literal joined to an identifier
+// by `+` in either order. A constant-only `"a" + "b"` never matches.
+const literalPlusVar = `[^;` + "\n" + `]*(?:["'` + "`" + `]\s*\+\s*[A-Za-z_$]|[A-Za-z_$][\w$]*\s*\+\s*["'` + "`" + `])`
+
+// templateInterpolation is a `${...}` template substitution: output built at runtime.
+const templateInterpolation = `[^;` + "\n" + `]*\$\{`
+
 func safeLDAPFilter(line string) bool {
 	l := strings.ToLower(line)
 	return commentOnlyLine(line) || strings.Contains(l, "escape_filter_chars(") ||
@@ -137,6 +212,88 @@ var redosContextRe = regexp.MustCompile(`(?i)(regexp\.|RegExp|re\.(compile|match
 // skipUnlessRegexContext skips a line that is a comment or does not look like regex construction.
 func skipUnlessRegexContext(line string) bool {
 	return commentOnlyLine(line) || !redosContextRe.MatchString(line)
+}
+
+// nestedQuantifiedGroupRe finds every quantified group that itself contains a quantifier, the shape
+// the ReDoS rule reports, together with the first characters inside the group.
+var nestedQuantifiedGroupRe = regexp.MustCompile(`\((?:\?:)?([^()\n]{0,80}[+*][^()\n]{0,80})\)\s*[+*]`)
+
+// skipUnlessAmbiguousNestedQuantifier keeps the ReDoS rule to groups whose repetition is ambiguous.
+// A nested group that begins with an escaped literal separator, such as (?:\.[0-9]+)* in a version
+// pattern, can only re-enter on that separator, so the engine never has two ways to split the same
+// run of characters and cannot backtrack exponentially.
+func skipUnlessAmbiguousNestedQuantifier(line string) bool {
+	if skipUnlessRegexContext(line) {
+		return true
+	}
+	ambiguous := false
+	for _, m := range nestedQuantifiedGroupRe.FindAllStringSubmatch(line, -1) {
+		inner := strings.TrimLeft(m[1], "^")
+		if separatedRepeat(inner) {
+			continue
+		}
+		ambiguous = true
+	}
+	return !ambiguous
+}
+
+// separatedRepeat reports whether a group body starts with a literal that cannot be produced by the
+// quantified atom that follows it: an escaped punctuation character or a bare separator.
+func separatedRepeat(inner string) bool {
+	if len(inner) >= 2 && inner[0] == '\\' && strings.ContainsRune(`.-/,;:|_= `, rune(inner[1])) {
+		return true
+	}
+	return len(inner) >= 1 && strings.ContainsRune(`-/,;:|_= `, rune(inner[0]))
+}
+
+// goResponseWriterArg names the first argument of a Go fmt.Fprint* call that is plausibly an HTTP
+// response writer. fmt.Fprintln(os.Stderr, err) is a CLI printing an error, not a reflected write.
+const goResponseWriterArg = `(?:w|rw|res|resp|rsp|response|writer|c\.Writer|ctx\.Writer|ctx\.Response\(\)(?:\.Writer)?|[a-zA-Z_]*[wW]riter)`
+
+// goSQLDynamicQueryRe is the database/sql dynamic-query shape; skipURLQueryOnly removes the request
+// URL's Query() from the line before re-testing it so r.URL.Query().Get("q") is not a SQL query.
+var goSQLDynamicQueryRe = regexp.MustCompile(`(?i)\.(Query|QueryContext|QueryRow|QueryRowContext|Exec|ExecContext)\s*\([^;\n]*(\+|fmt\.Sprintf|FormValue|PostFormValue|URL\.Query|c\.(Query|Param))`)
+
+var urlQueryCallRe = regexp.MustCompile(`(?i)\bURL\.Query\(\)`)
+
+func skipURLQueryOnly(line string) bool {
+	if commentOnlyLine(line) {
+		return true
+	}
+	stripped := urlQueryCallRe.ReplaceAllString(line, "URLQUERY")
+	return !goSQLDynamicQueryRe.MatchString(stripped)
+}
+
+// credentialAssignmentRe captures the identifier and the quoted value of a credential-shaped
+// assignment: `MetricNewSecret = "new_secret"`, `cookieSecret: "..."`, `app.config['SECRET_KEY'] = '...'`.
+var credentialAssignmentRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_.]*)["']?\s*\]?\s*[:=]\s*["']([^"'\s]{6,})["']`)
+
+// labelIdentifierMarkers are identifier fragments that describe a metric, an enum member, a pattern set
+// or a category. A secret concept named by such an identifier is a label, not credential material.
+var labelIdentifierMarkers = []string{"metric", "pattern", "kind", "type", "label", "enum", "category", "status", "state", "setid", "set_id", "algorithm", "scheme", "mode"}
+
+// versionedLabelValueRe is a lowercase word list ending in a version tag: "secret-patterns:v2".
+var versionedLabelValueRe = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[_\-./][a-z0-9]+)*:v?\d+$`)
+
+// skipCommentPlaceholderOrLabelSecret extends the placeholder filter with assignments whose identifier
+// names a label: MetricNewSecret = "new_secret" or secretPatternSetID = "secret-patterns:v2" describe
+// a secret concept; they do not contain one. The value alone is not enough to decide (a literal
+// "secret" assigned to a secret key IS the finding), so the identifier carries the decision.
+func skipCommentPlaceholderOrLabelSecret(line string) bool {
+	if skipCommentOrPlaceholderSecret(line) {
+		return true
+	}
+	m := credentialAssignmentRe.FindStringSubmatch(line)
+	if m == nil {
+		return false
+	}
+	ident := strings.ToLower(m[1])
+	for _, marker := range labelIdentifierMarkers {
+		if strings.Contains(ident, marker) {
+			return true
+		}
+	}
+	return versionedLabelValueRe.MatchString(m[2])
 }
 
 func builtinRules() []rule {
@@ -158,15 +315,17 @@ func builtinRules() []rule {
 		},
 		{
 			id: "insecure-tls-verify-disabled", cwe: "CWE-295", severity: shared.SeverityHigh, title: "TLS certificate verification disabled",
-			desc: "Disabling certificate verification enables machine-in-the-middle attacks; verify certificates in production.",
-			re:   regexp.MustCompile(`(?i)(InsecureSkipVerify\s*:\s*true|verify\s*=\s*False|rejectUnauthorized\s*:\s*false|CURLOPT_SSL_VERIFYPEER\s*,\s*(0|false))`),
+			desc:   "Disabling certificate verification enables machine-in-the-middle attacks; verify certificates in production.",
+			re:     regexp.MustCompile(`(?i)(InsecureSkipVerify\s*:\s*true|verify\s*=\s*False|rejectUnauthorized\s*:\s*false|CURLOPT_SSL_VERIFYPEER\s*,\s*(0|false))`),
+			skipFn: skipJWTVerifyFlag, // jwt.decode(token, verify=False) is claim validation, not TLS
 		},
 		{
 			id: "debug-mode-enabled", cwe: "CWE-489", severity: shared.SeverityMedium, title: "Active debug mode enabled",
 			desc: "Debug mode is enabled in source (verbose errors, interactive debuggers, stack traces leak internals). Disable it in production builds.",
 			// High-signal forms only: a literal debug=true assignment (Django/Flask/generic), Flask app.run(debug=True),
 			// and Gin's debug mode. \b avoids is_debug/app_debug; env-derived RHS (debug=os.getenv(...)) never matches "true".
-			re: regexp.MustCompile(`(?i)(\bdebug\s*=\s*true\b|app\.run\([^)]*debug\s*=\s*true|gin\.SetMode\(\s*gin\.DebugMode\s*\))`),
+			re:     regexp.MustCompile(`(?i)(\bdebug\s*=\s*true\b|app\.run\([^)]*debug\s*=\s*true|gin\.SetMode\(\s*gin\.DebugMode\s*\))`),
+			skipFn: commentOnlyLine,
 		},
 		{
 			id: "permissive-cors-wildcard", cwe: "CWE-942", severity: shared.SeverityMedium, title: "Permissive CORS: wildcard origin",
@@ -183,13 +342,23 @@ func builtinRules() []rule {
 		{
 			id: "private-key-material", cwe: "CWE-798", severity: shared.SeverityCritical, title: "Private key material in source",
 			desc: "A PEM private-key block is embedded in source. Remove it from the repository and rotate the key.",
-			re:   regexp.MustCompile(`-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----`),
+			// The header alone is not key material: it appears in delimiter constants
+			// (`String s = "-----BEGIN PRIVATE KEY-----\\n";`) and in strip helpers
+			// (`.replace("-----BEGIN PRIVATE KEY-----", "")`). A real key follows the header with a
+			// base64 body \u2013 on the next line of a PEM file, or after an escaped newline inside a
+			// string literal \u2013 so anchor on that body, or on a header that is the whole line.
+			re: regexp.MustCompile(`-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----(\s*$|\s*(\\r)?\\n\s*[A-Za-z0-9+/=]{4,}|\s*[A-Za-z0-9+/=]{16,})`),
 		},
 		{
 			id: "hardcoded-credential", cwe: "CWE-798", severity: shared.SeverityHigh, title: "Possible hardcoded credential",
-			desc:   "A credential appears to be assigned a literal value. Load secrets from the environment or a vault instead of embedding them.",
-			re:     regexp.MustCompile(`(?i)\b(password|passwd|pwd|api[_-]?key|secret|access[_-]?token|auth[_-]?token)\b\s*[:=]\s*["'][^"'\s]{8,}["']`),
-			skipFn: placeholderSecret,
+			desc: "A credential appears to be assigned a literal value. Load secrets from the environment or a vault instead of embedding them.",
+			// The key had to be a WHOLE word with `\b`, which missed the two shapes real config
+			// uses: camelCase (`cookieSecret: "\u2026"`) and a bracketed config key
+			// (`app.config['SECRET_KEY_HMAC'] = '\u2026'`). The keyword may now carry an identifier
+			// suffix and sit inside brackets/quotes, and the value minimum drops to 6 so a literal
+			// `'secret'` counts. The placeholder skip list is what keeps the rule high-signal.
+			re:     regexp.MustCompile(`(?i)(?:password|passwd|pwd|api[_-]?key|secret|access[_-]?token|auth[_-]?token)[A-Za-z0-9_]{0,32}["']?\s*\]?\s*[:=]\s*["'][^"'\s^~<>=][^"'\s]{5,}["']`),
+			skipFn: skipCommentPlaceholderOrLabelSecret,
 		},
 		{
 			id: "password-md5-hash", cwe: "CWE-916", severity: shared.SeverityMedium, title: "Password hashed with unsalted MD5",
@@ -226,8 +395,9 @@ func builtinRules() []rule {
 		{
 			id: "go-sql-dynamic-query", cwe: "CWE-89", severity: shared.SeverityHigh, title: "Go SQL query uses dynamic string construction",
 			desc:   "A Go database/sql query appears to use string concatenation, fmt.Sprintf, or request-derived data. Use placeholders and parameter binding.",
-			re:     regexp.MustCompile(`(?i)\.(Query|QueryContext|QueryRow|QueryRowContext|Exec|ExecContext)\s*\([^;\n]*(\+|fmt\.Sprintf|FormValue|PostFormValue|URL\.Query|c\.(Query|Param))`),
-			skipFn: commentOnlyLine,
+			re:     goSQLDynamicQueryRe,
+			skipFn: skipURLQueryOnly,
+			exts:   goExts, // database/sql is Go: without the gate this matched minified JS
 		},
 		{
 			id: "sqlalchemy-raw-sql-dynamic", cwe: "CWE-89", severity: shared.SeverityHigh, title: "Python SQLAlchemy/raw SQL uses dynamic string construction",
@@ -251,9 +421,27 @@ func builtinRules() []rule {
 		},
 		{
 			id: "go-command-dynamic", cwe: "CWE-78", severity: shared.SeverityHigh, title: "Go command execution receives dynamic input",
-			desc:   "exec.Command/CommandContext appears to receive request-derived or dynamically built arguments. Use fixed argv templates and strict allowlists.",
-			re:     regexp.MustCompile(`(?i)exec\.Command(Context)?\s*\([^;\n]*(FormValue|PostFormValue|URL\.Query|c\.(Query|Param)|\+|fmt\.Sprintf|[A-Za-z_$][\w$]*)`),
+			desc: "exec.Command/CommandContext appears to receive request-derived or dynamically built arguments. Use fixed argv templates and strict allowlists.",
+			// A trailing "any identifier" alternative used to fire on a word INSIDE the argument
+			// string, so a fully constant `exec.Command("git", "status")` was reported as command
+			// injection. The evidence now has to be a request marker reached without crossing a
+			// quote, a concat/Sprintf, or an argument that is a bare variable. CommandContext is
+			// split out so its mandatory ctx first argument is not read as that variable.
+			re: regexp.MustCompile(`(?i)exec\.Command\s*\(` + commandArgEvidence +
+				`|(?i)exec\.CommandContext\s*\([^,;\n]*,` + commandArgEvidence),
 			skipFn: commentOnlyLine,
+		},
+		{
+			id: "go-subprocess-untrusted-arg", cwe: "CWE-88", severity: shared.SeverityMedium, title: "Untrusted value passed as a subprocess argument",
+			desc: "A request-derived value is passed as an argument to a subprocess. exec.Command spawns the program directly, so this is not command injection, but the callee may treat the value as an option or a path. Validate it against an allowlist and pass `--` before positional arguments.",
+			// Deliberately separate from go-command-dynamic and a step lower in severity. The
+			// Contrast go-test-bench corpus labels `exec.Command("echo", in)` as the SAFE way to
+			// pass untrusted input, and it is: there is no shell to re-parse anything. Reporting it
+			// as CWE-78 cost precision on the one shape the rule most needs to get right. What is
+			// left is a real but bounded risk, argument injection, and it is named as that.
+			re:     regexp.MustCompile(`(?i)exec\.Command(?:Context)?\s*\([^;` + "\n" + `]*` + requestMarkerNoQuote + `[^;` + "\n" + `]*\)`),
+			skipFn: commentOnlyLine,
+			exts:   goExts,
 		},
 		{
 			id: "unsafe-deserialization-node-serialize", cwe: "CWE-502", severity: shared.SeverityHigh, title: "Unsafe node-serialize deserialization",
@@ -270,8 +458,12 @@ func builtinRules() []rule {
 		},
 		{
 			id: "ssrf-fetch-user-url", cwe: "CWE-918", severity: shared.SeverityHigh, title: "Server-side fetch of user-controlled URL",
-			desc:   "A server-side fetch appears to use a generic url variable or request field. Validate scheme/host, block private networks/metadata IPs, and proxy through an allowlist.",
-			re:     regexp.MustCompile(`(?i)\b(fetch|axios\.(get|post|put|request))\s*\(\s*([A-Za-z_$][\w$]*|url\b|req\.(body|query|params)|.*\burl\b)`),
+			desc: "A server-side fetch appears to use a generic url variable or request field. Validate scheme/host, block private networks/metadata IPs, and proxy through an allowlist.",
+			// `fetch` must be the GLOBAL function, not a method: `\bfetch` also matched Ruby's
+			// Hash#fetch, so every `user_map.fetch(key)` was reported as SSRF. The rule stays
+			// language-agnostic (server-side JS runs under several extensions) and the browser
+			// gate in the scan loop drops DOM-context files.
+			re:     regexp.MustCompile(`(?i)(?:(?:^|[^.\w])fetch|axios\.(?:get|post|put|request))\s*\(\s*([A-Za-z_$][\w$]*|url\b|req\.(body|query|params)|.*\burl\b)`),
 			skipFn: commentOnlyLine,
 		},
 		{
@@ -295,8 +487,19 @@ func builtinRules() []rule {
 		},
 		{
 			id: "reflected-response-write", cwe: "CWE-79", severity: shared.SeverityHigh, title: "Response writes potentially unescaped request data",
-			desc:   "A response sink appears to write request-controlled data. Ensure framework auto-escaping applies or explicitly HTML-escape before writing.",
-			re:     regexp.MustCompile(`(?i)(res\.(send|end|write)|response\.write|HttpResponse|w\.Write)\s*\([^;\n]*(req\.|request\.|params\[|\$_(GET|POST|REQUEST)|FormValue|URL\.Query|c\.(Query|Param)|[A-Za-z_$][\w$]*)`),
+			desc: "A response sink appears to write request-controlled data. Ensure framework auto-escaping applies or explicitly HTML-escape before writing.",
+			// The old trailing `[A-Za-z_$][\w$]*` alternative matched ANY identifier anywhere in the
+			// argument text, including a word inside a quoted string, so `res.write("\\n\\n")` and
+			// `res.send("Hello world")` were reported as reflected XSS. Evidence is now a request
+			// marker reached without crossing a quote, an argument that is a bare variable, or a
+			// literal concatenated with one. Go's fmt.Fprint* and Gin's c.String take a
+			// writer/status first, so their evidence starts after that argument.
+			re: regexp.MustCompile(`(?i)(?:res\.(?:send|end|write)|response\.write|HttpResponse|w\.Write)\s*\(` +
+				`(?:` + requestMarkerNoQuote + `|` + bareFirstArg + `|` + literalPlusVar + `|` + templateInterpolation + `)` +
+				`|(?i)fmt\.Fprint(?:f|ln)?\s*\(\s*` + goResponseWriterArg + `\s*,` +
+				`(?:` + requestMarkerNoQuote + `|` + bareFirstArg + `|` + bareLaterArg + `|` + literalPlusVar + `|` + templateInterpolation + `)` +
+				`|(?i)c\.String\s*\(` +
+				`(?:` + requestMarkerNoQuote + `|` + bareLaterArg + `|` + literalPlusVar + `|` + templateInterpolation + `)`),
 			skipFn: commentOnlyLine,
 		},
 		{
@@ -326,7 +529,7 @@ func builtinRules() []rule {
 		{
 			id: "jwt-hardcoded-secret-or-none", cwe: "CWE-347", severity: shared.SeverityHigh, title: "JWT uses hardcoded secret or insecure algorithm",
 			desc:   "JWT signing/verifying with a hardcoded weak secret or accepting the none algorithm can allow token forgery. Use managed secrets and enforce strong algorithms.",
-			re:     regexp.MustCompile(`(?i)(jwt\.(sign|verify)\s*\([^,\n]+,\s*["'](secret|changeme|password|jwt[_-]?secret|test)["']|algorithm\s*[:=]\s*["']none["']|algorithms\s*[:=]\s*\[[^\]]*["']none["'])`),
+			re:     regexp.MustCompile(`(?i)(jwt\.(sign|verify)\s*\([^,\n]+,\s*["'](secret|changeme|password|jwt[_-]?secret|test)["']|\balgorithm\s*[:=]\s*["']none["']|\balgorithms\s*[:=]\s*\[[^\]]*["']none["'])`),
 			skipFn: commentOrTestPlaceholder,
 		},
 		{
@@ -438,7 +641,7 @@ func builtinRules() []rule {
 			id: "redos-vulnerable-regex", cwe: "CWE-1333", severity: shared.SeverityMedium, title: "Regular expression vulnerable to catastrophic backtracking (ReDoS)",
 			desc:   "A regex nests a quantifier inside a quantified group (e.g. (a+)+, (.*)*), which backtracks exponentially on crafted input and can hang the process. Rewrite without nested quantifiers, anchor the pattern, or use a linear-time engine.",
 			re:     regexp.MustCompile(`\([^()\n]{0,80}[+*][^()\n]{0,80}\)\s*[+*]`),
-			skipFn: skipUnlessRegexContext,
+			skipFn: skipUnlessAmbiguousNestedQuantifier,
 		},
 		{
 			id: "insecure-temp-file", cwe: "CWE-377", severity: shared.SeverityMedium, title: "Insecure temporary file",

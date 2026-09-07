@@ -57,8 +57,8 @@ func isolatedIntegrationDatabase(t *testing.T, ctx context.Context, sharedDSN st
 	return isolationConfig.ConnString()
 }
 
-func TestMigration0130DefinesBoundedProviderNeutralRLSSchema(t *testing.T) {
-	contents, err := migrations.FS.ReadFile("0130_integration_framework.sql")
+func TestMigration0137DefinesBoundedProviderNeutralRLSSchema(t *testing.T) {
+	contents, err := migrations.FS.ReadFile("0137_integration_framework.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

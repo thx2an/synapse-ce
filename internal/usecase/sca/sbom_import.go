@@ -31,6 +31,26 @@ func (s *Service) ImportSBOMFile(ctx context.Context, actor string, tenantID, en
 	if _, err := s.engagements.GetByIDInTenant(ctx, tenantID, engagementID); err != nil {
 		return nil, fmt.Errorf("load engagement: %w", err)
 	}
+	return s.importSBOM(ctx, actor, tenantID, engagementID, filename, data)
+}
+
+// ImportContextSBOM records a CycloneDX document on a machine-owned engagement context (a Project
+// analysis context or a fleet host vulnerability context), which the tenant-scoped engagement read
+// deliberately hides. It is not a request-path read: the caller resolved the context through its
+// owning aggregate. The engagement must belong to tenantID and be internal, so an operator
+// engagement can never be reached through this entry point.
+func (s *Service) ImportContextSBOM(ctx context.Context, actor string, tenantID, engagementID shared.ID, filename string, data []byte) (*ScanResult, error) {
+	eng, err := s.engagements.GetByID(ctx, engagementID)
+	if err != nil {
+		return nil, fmt.Errorf("load engagement: %w", err)
+	}
+	if shared.TenantOrDefault(eng.TenantID) != shared.TenantOrDefault(tenantID) || !eng.Internal() {
+		return nil, fmt.Errorf("load engagement: %w", shared.ErrNotFound)
+	}
+	return s.importSBOM(ctx, actor, tenantID, engagementID, filename, data)
+}
+
+func (s *Service) importSBOM(ctx context.Context, actor string, tenantID, engagementID shared.ID, filename string, data []byte) (*ScanResult, error) {
 	parsed, err := parseCycloneDX(data)
 	if err != nil {
 		return nil, err
@@ -203,6 +223,17 @@ var supportedCDXSpecVersions = map[string]bool{"1.4": true, "1.5": true, "1.6": 
 
 func supportedCDXSpecVersion(v string) bool {
 	return supportedCDXSpecVersions[strings.TrimSpace(v)]
+}
+
+// ParseCycloneDXComponents returns the components of a CycloneDX document: name, version, PURL and
+// licences, as the import path reads them. Read-side callers (a host's package list) use it to show
+// what an imported SBOM contains without re-running the pipeline.
+func ParseCycloneDXComponents(data []byte) ([]sbom.Component, error) {
+	parsed, err := parseCycloneDX(data)
+	if err != nil {
+		return nil, err
+	}
+	return parsed.Components, nil
 }
 
 // parseCycloneDX decodes a CycloneDX JSON document into domain components + the

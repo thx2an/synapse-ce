@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1409,5 +1410,119 @@ func TestPurgeDeletesOnDemandAuditedAndHoldChecked(t *testing.T) {
 	// Nothing left → a second purge is a no-op (not an error).
 	if n, err := h.svc.Purge(tctx(), "eng-1", "dpo", "erasure"); err != nil || n != 0 {
 		t.Fatalf("purge of an empty engagement must be a no-op, got n=%d err=%v", n, err)
+	}
+}
+
+// ---- correlation on ingest ------------------------------------------------------------------------------
+
+// A wired correlator runs as soon as a batch seals new detections, with the agent as actor, and its count
+// lands in the result. A replayed batch seals nothing and does not correlate again.
+func TestIngestCorrelatesSealedDetectionsOnce(t *testing.T) {
+	h := newHarness(t, 0)
+	var calls int
+	var gotActor string
+	var gotEng shared.ID
+	h.svc.SetCorrelator(func(_ context.Context, actor string, engagementID shared.ID) (int, error) {
+		calls++
+		gotActor, gotEng = actor, engagementID
+		return 2, nil
+	})
+	items := []IngestItem{{ID: "d1", AssetID: "asset-1", Detection: mkDetection(t, "ps")}}
+	b := h.signedBatch(t, 1, items)
+	res, err := h.svc.Ingest(tctx(), b.AgentID, b, items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.CorrelationScheduled {
+		t.Fatalf("result = %+v", res)
+	}
+	h.svc.WaitCorrelation()
+	if calls != 1 || gotActor != "agent:1" || gotEng != "eng-1" {
+		t.Fatalf("correlator call = %d actor=%q eng=%q", calls, gotActor, gotEng)
+	}
+	replay, err := h.svc.Ingest(tctx(), b.AgentID, b, items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc.WaitCorrelation()
+	if calls != 1 || replay.CorrelationScheduled || len(replay.Skipped) != 1 {
+		t.Fatalf("replay correlated again: calls=%d result=%+v", calls, replay)
+	}
+}
+
+// Batches that land while a run is in flight cost one rerun, not one run each, and the run uses a
+// context that outlives the requests.
+func TestIngestCoalescesConcurrentCorrelation(t *testing.T) {
+	h := newHarness(t, 0)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	h.svc.SetCorrelator(func(ctx context.Context, _ string, _ shared.ID) (int, error) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			close(started)
+			<-release
+		}
+		if ctx.Err() != nil {
+			t.Errorf("correlation ran with a cancelled context")
+		}
+		return 0, nil
+	})
+	for i := 1; i <= 4; i++ {
+		items := []IngestItem{{ID: shared.ID("d" + strconv.Itoa(i)), AssetID: "asset-1", Detection: mkDetection(t, "ps")}}
+		b := h.signedBatch(t, uint64(i), items)
+		ctx, cancel := context.WithCancel(tctx())
+		if _, err := h.svc.Ingest(ctx, b.AgentID, b, items); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		if i == 1 {
+			<-started
+		}
+	}
+	close(release)
+	h.svc.WaitCorrelation()
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("correlator ran %d times for 4 batches; want the first run plus one coalesced rerun", calls)
+	}
+}
+
+// A correlator failure never fails the ingest: the detections are sealed, the failure is audited, and the
+// result says correlation did not happen.
+func TestIngestCorrelatorFailureIsAuditedNotFatal(t *testing.T) {
+	h := newHarness(t, 0)
+	h.svc.SetCorrelator(func(context.Context, string, shared.ID) (int, error) { return 0, errors.New("incident store down") })
+	items := []IngestItem{{ID: "d1", AssetID: "asset-1", Detection: mkDetection(t, "ps")}}
+	b := h.signedBatch(t, 1, items)
+	res, err := h.svc.Ingest(tctx(), b.AgentID, b, items)
+	if err != nil {
+		t.Fatalf("correlator failure must not fail the ingest: %v", err)
+	}
+	if len(res.SealedRecords) != 1 || !res.CorrelationScheduled {
+		t.Fatalf("result = %+v", res)
+	}
+	h.svc.WaitCorrelation()
+	e, ok := h.audit.last["detection.correlate_on_ingest_failed"]
+	if !ok || e.Metadata["error"] != "incident store down" || e.Metadata["engagement"] != "eng-1" {
+		t.Fatalf("failure not audited: %+v (actions %v)", e, h.audit.actions)
+	}
+}
+
+func TestIngestWithoutCorrelatorIsUnchanged(t *testing.T) {
+	h := newHarness(t, 0)
+	items := []IngestItem{{ID: "d1", AssetID: "asset-1", Detection: mkDetection(t, "ps")}}
+	b := h.signedBatch(t, 1, items)
+	res, err := h.svc.Ingest(tctx(), b.AgentID, b, items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.CorrelationScheduled {
+		t.Fatalf("result = %+v", res)
 	}
 }

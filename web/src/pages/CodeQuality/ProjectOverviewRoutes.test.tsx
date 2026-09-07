@@ -13,6 +13,7 @@ import { ProjectOverviewPage } from './ProjectOverviewPage'
 
 vi.mock('../../lib/api', () => ({
   api: {
+    projectBranches: vi.fn(() => Promise.resolve([])),
     getProject: vi.fn(),
     projectAnalysisStatus: vi.fn(),
     projectOverview: vi.fn(),
@@ -61,6 +62,8 @@ function buildAnalysis(id: string, sourceRef: string): ProjectAnalysis {
   return {
     id,
     createdAt: '2026-07-18T00:00:00Z',
+    origin: 'server',
+    ci: null,
     sourceRef,
     sourceCommit: `${id}abcdef1234567890`,
     gate: { passed: true, results: [] },
@@ -96,12 +99,23 @@ describe('Project Overview routes', () => {
     vi.mocked(api.listQualityGates).mockResolvedValue([])
   })
 
+  it('scopes the overview to the branch chosen in the selector and reflects it in the URL', async () => {
+    vi.mocked(api.projectBranches).mockResolvedValue(['develop', 'main'])
+    const router = renderProjectRoute('/code-quality/projects/synapse')
+    await waitFor(() => expect(api.projectOverview).toHaveBeenCalledWith('synapse', 'main'))
+    const select = await screen.findByLabelText('Branch')
+    expect(await screen.findByRole('option', { name: /develop/ })).toBeInTheDocument()
+    fireEvent.change(select, { target: { value: 'develop' } })
+    await waitFor(() => expect(api.projectOverview).toHaveBeenCalledWith('synapse', 'develop'))
+    expect(router.state.location.search).toContain('branch=develop')
+  })
+
   it('loads Overview without fetching the full latest analysis or activity history', async () => {
     renderProjectRoute('/code-quality/projects/synapse')
     expect(await screen.findByText('Quality Gate Failed')).toBeInTheDocument()
     expect(api.getProject).toHaveBeenCalledWith('synapse')
     expect(api.projectAnalysisStatus).toHaveBeenCalledWith('synapse')
-    expect(api.projectOverview).toHaveBeenCalledWith('synapse')
+    expect(api.projectOverview).toHaveBeenCalledWith('synapse', expect.any(String))
     expect(api.latestProjectAnalysis).not.toHaveBeenCalled()
     expect(api.projectAnalyses).not.toHaveBeenCalled()
   })
@@ -172,7 +186,7 @@ describe('Project Overview routes', () => {
     vi.mocked(api.listQualityGates).mockResolvedValue([])
     renderProjectRoute('/code-quality/projects/synapse/activity')
     expect(await screen.findByText('No analysis history yet')).toBeInTheDocument()
-    expect(api.projectAnalyses).toHaveBeenCalledWith('synapse')
+    expect(api.projectAnalyses).toHaveBeenCalledWith('synapse', null, expect.any(String))
     expect(api.latestProjectAnalysis).not.toHaveBeenCalled()
     expect(api.projectOverview).not.toHaveBeenCalled()
   })

@@ -64,12 +64,25 @@ against a hostile filesystem or a crafted package database.
 
 ## First-party SAST and code quality
 
-Synapse ships its own source-code analysis, not just dependency scanning. First-party SAST rules
-run across many languages and feed a taint engine over the sandboxed `go/ssa` and tree-sitter call
-graphs; confirmed results emit `Kind=sast` findings. A SonarQube-style code-quality surface adds
-quality rules, quality gates and quality profiles, and hotspots. Third-party results enter the same
-governance path through **SARIF ingest**, so findings from other scanners are de-duplicated,
-prioritized, and reported alongside first-party ones.
+Synapse ships its own source-code analysis, not just dependency scanning. Two distinct engines, with
+distinct guarantees, so it is worth being precise about what each does.
+
+The first-party SAST engine is a **pattern scanner for dangerous idioms**: a deterministic rule set
+over single lines with a bounded ten-line look-back, across many languages. It is good, and fast, at
+the class of bug that is visible in one place: a weak hash, a hardcoded credential, a shell command
+built by string concatenation, an unsafe deserializer. It is not an interprocedural or cross-file
+dataflow analyzer, and does not reason about framework routing, aliasing, or sanitizers, so it does
+not claim parity with a dataflow product. Its precision is pinned to a labelled corpus by the
+`TestLabelledCorpusPrecisionAndRecall` gate. Confirmed hits emit `Kind=sast` findings.
+
+The stronger asset is the **reachability engine**: a taint and call-graph analysis over the sandboxed
+`go/ssa` and tree-sitter graphs (`taintcallgraph`, `ssacallgraph`, `jvmreach`, `pyreach`, `srcreach`).
+A finding it proves reachable is worth more than a larger pile of unproven ones, and a
+statically-proven hypothesis can be confirmed at runtime by a safe DAST probe (see below).
+
+A SonarQube-style code-quality surface adds quality rules, quality gates and quality profiles, and
+hotspots. Third-party results enter the same governance path through **SARIF ingest**, so findings
+from other scanners are de-duplicated, prioritized, and reported alongside first-party ones.
 
 ## Offensive testing (red team)
 
@@ -78,8 +91,12 @@ inside the hardened sandbox with server-side scope and authorization:
 
 - **Recon** enumerates a target's surface within the authorized scope.
 - An **attack-path graph** correlates the asset inventory into reachable exposure chains.
-- **Chained exploitation** advances step by step, each step producing its own proof; nothing
-  promotes without a distinct verifier's sealed verdict.
+- **Chained exploitation** advances step by step, each step admitted through the engagement's rules of
+  engagement, producing its own sealed proof, and verified by a distinct verifier before the chain
+  advances; a running chain is haltable by the kill switch. It runs as a governed no-host rehearsal
+  (simulation) by default, reachable at `POST /engagements/{id}/exploitation/rehearsals`; a real host
+  executor is a deliberate, review-gated extension point. The rehearsal route and the offensive kill
+  switch are wired when the fleet transport is enabled.
 - **Adversary emulation** runs benign technique variants that declare the detection each technique
   should produce — the offensive half of the purple-team ledger.
 
@@ -88,7 +105,8 @@ inside the hardened sandbox with server-side scope and authorization:
 A distributed **agent fleet** extends Synapse from point-in-time analysis to runtime, over both host
 and Kubernetes estates:
 
-- **Agents** collect host inventory and Kubernetes workload/exposure/identity inventory, with
+- **Agents** collect host inventory (facts and installed OS packages, correlated with advisories into
+  per-host CVE findings) and Kubernetes workload/exposure/identity inventory, with
   certificate enrolment, signed packaging and updates, per-asset coverage and freshness, and fenced
   leadership so scheduled work runs once.
 - An **eBPF detection engine** observes process, file, network, and privilege events and evaluates a
@@ -98,7 +116,9 @@ and Kubernetes estates:
 - A **columnar telemetry tier** retains raw events with a retention/cost model for retro-hunting.
 - **Governed response actions** (isolate host, quarantine file, stop process) run under the *same*
   admission model as exploitation: server-side authorization, a human-approved sealed evidence
-  record, argv-only execution, a mandatory reversal, and a declared blast radius.
+  record, argv-only execution, a mandatory reversal, and a declared blast radius. The plan, apply,
+  revert and list routes live under `/api/v1/blueteam/response`; the default executor records the full
+  governed ledger without a host effect, and the kill switch cancels pending actions.
 - **Purple-team coverage** measures which techniques would actually be detected by joining
   emulation-expected detections with what actually fired, and reports the gap as a first-class number.
 

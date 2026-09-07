@@ -83,7 +83,7 @@ func TestResolveComparisonUsesFetchedBaseRef(t *testing.T) {
 	workspace := t.TempDir()
 	git(t, workspace, "clone", "--depth", "1", "--branch", "feature", "file://"+bare, ".")
 	head := strings.TrimSpace(git(t, workspace, "rev-parse", "HEAD"))
-	base, mergeBase := acquirer.resolveComparison(context.Background(), workspace, "https://example.invalid/repo.git", nil, head, "feature", "main", "")
+	base, mergeBase := acquirer.resolveComparison(context.Background(), workspace, "https://example.invalid/repo.git", nil, nil, head, "feature", "main", "")
 	if base == "" || mergeBase == "" {
 		t.Fatalf("base=%q mergeBase=%q, want resolved comparison", base, mergeBase)
 	}
@@ -95,6 +95,15 @@ func TestResolveComparisonUsesFetchedBaseRef(t *testing.T) {
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	// Run git without the developer's global and system configuration. A machine-level
+	// core.hooksPath or commit template makes these fixtures fail for one engineer and pass for
+	// another, which is worse than either outcome: the suite stops meaning the same thing
+	// everywhere.
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)

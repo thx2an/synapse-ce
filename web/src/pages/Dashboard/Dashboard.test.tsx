@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
-import { api } from '../../lib/api'
+import { api, ApiError } from '../../lib/api'
 import type { BusinessAsset, DashboardSecurityOperations, Engagement, FleetCoverageSummary } from '../../lib/types'
 import { DashboardPage as Dashboard } from './DashboardPage'
 
@@ -11,6 +11,15 @@ vi.mock('../../lib/api', () => ({
     listEngagements: vi.fn(),
     fleetCoverageSummary: vi.fn(),
     dashboardSecurityOperations: vi.fn(),
+  },
+  ApiError: class ApiError extends Error {
+    constructor(
+      public status: number,
+      message: string,
+    ) {
+      super(message)
+      this.name = 'ApiError'
+    }
   },
 }))
 
@@ -73,24 +82,35 @@ describe('Dashboard', () => {
     renderDashboard()
 
     expect(await screen.findByRole('heading', { name: 'Security Operations' })).toBeInTheDocument()
-    expect(screen.getByLabelText(/Total assets: 3/i)).toBeInTheDocument()
+    expect(await screen.findByLabelText('Critical open: 1')).toBeInTheDocument()
+    expect(screen.getByLabelText('High open: 2')).toBeInTheDocument()
     expect(screen.getByLabelText(/High-risk assets: 1/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/Active engagements: 1/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/Coverage gaps: 3/i)).toBeInTheDocument()
+
+    // The queue leads: the critical-posture asset, the two coverage gaps, the unscanned active engagement.
+    const queue = screen.getByRole('table', { name: 'Needs attention' })
+    const rows = within(queue).getAllByRole('row').slice(1)
+    expect(rows.map((row) => within(row).getAllByRole('cell')[1].textContent)).toEqual(['Asset posture', 'Coverage gap', 'Coverage gap', 'Not scanned'])
+    expect(within(rows[0]).getByText('Payments Platform')).toBeInTheDocument()
+    expect(within(rows[0]).getByRole('link', { name: 'Open findings' })).toHaveAttribute('href', '/assets/asset-critical')
+    expect(within(queue).getByText(/^2 stale capability checks/)).toBeInTheDocument()
+    expect(within(queue).getByText(/^1 unauthorized capability check/)).toBeInTheDocument()
+    expect(within(rows[3]).getByText('Payment API Review')).toBeInTheDocument()
+    expect(within(rows[3]).getByRole('link', { name: 'Start scan' })).toHaveAttribute('href', '/engagements/eng-active')
+    expect(screen.getByLabelText('Needs attention: 4')).toBeInTheDocument()
 
     const priorityAssets = screen.getByText('Priority Assets').closest('section')!
     expect(within(priorityAssets).getByText('Payments Platform')).toBeInTheDocument()
     expect(within(priorityAssets).getByText('Mobile Banking')).toBeInTheDocument()
     expect(within(priorityAssets).queryByText('Customer Portal')).not.toBeInTheDocument()
 
-    expect(screen.getByText('Payment API Review')).toBeInTheDocument()
+    expect(screen.getAllByText('Payment API Review').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Payments Platform').length).toBeGreaterThan(0)
     expect(screen.getByText('New Service Review')).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: 'Asset Security Posture' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Findings Over Time' })).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: 'Active Finding Risk Mix' })).toBeInTheDocument()
-    expect(screen.getByLabelText('Asset Security Posture: 3 total')).toBeInTheDocument()
-    expect(screen.getByLabelText('Active Finding Risk Mix: 7 total')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Asset Security Posture' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Active Finding Risk Mix' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('Excluded findings info')).toBeInTheDocument()
   })
 
@@ -108,8 +128,18 @@ describe('Dashboard', () => {
     vi.mocked(api.fleetCoverageSummary).mockRejectedValue(new Error('fleet disabled'))
     renderDashboard()
 
-    expect(await screen.findByLabelText(/Total assets: 3/i)).toBeInTheDocument()
+    expect(await screen.findByLabelText(/High-risk assets: 1/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/Coverage gaps: N\/A/i)).toBeInTheDocument()
+  })
+
+  it('blanks the coverage tile and explains in the tooltip when fleet routes are absent', async () => {
+    vi.mocked(api.fleetCoverageSummary).mockRejectedValue(new ApiError(404, 'HTTP 404'))
+    renderDashboard()
+
+    // Fleet-disabled shows an em dash; the reason lives in the tile's info tooltip, not as a value.
+    expect(await screen.findByLabelText('Coverage gaps: —')).toBeInTheDocument()
+    expect(screen.getByText(/SYNAPSE_FLEET_ENABLED=true/)).toBeInTheDocument()
+    expect(screen.queryByLabelText(/Coverage gaps: N\/A/i)).not.toBeInTheDocument()
   })
 
   it('reloads the finding trend for a selected range', async () => {
@@ -122,7 +152,17 @@ describe('Dashboard', () => {
   it('keeps the operational dashboard visible when analytics fails', async () => {
     vi.mocked(api.dashboardSecurityOperations).mockRejectedValue(new Error('analytics unavailable'))
     renderDashboard()
-    expect(await screen.findByLabelText(/Total assets: 3/i)).toBeInTheDocument()
+    expect(await screen.findByLabelText(/High-risk assets: 1/i)).toBeInTheDocument()
+    expect(screen.getByLabelText('Critical open: —')).toBeInTheDocument()
     expect(await screen.findByText('analytics unavailable')).toBeInTheDocument()
+  })
+
+  it('says when nothing needs attention', async () => {
+    vi.mocked(api.listBusinessAssets).mockResolvedValue({ items: [assets[2]], total: 1, limit: 200, offset: 0 })
+    vi.mocked(api.listEngagements).mockResolvedValue([{ ...engagements[0], lastScanDate: '2026-08-10T00:00:00Z', lastScanStatus: 'succeeded' }])
+    vi.mocked(api.fleetCoverageSummary).mockResolvedValue({ ...fleet, rowsByVerdict: { covered: 5 } })
+    renderDashboard()
+    expect(await screen.findByText('Nothing needs attention')).toBeInTheDocument()
+    expect(screen.getByLabelText('Needs attention: 0')).toBeInTheDocument()
   })
 })

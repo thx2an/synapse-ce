@@ -9,6 +9,7 @@ import (
 
 	"github.com/KKloudTarus/synapse-ce/internal/domain/advisory"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/aitriagereview"
+	"github.com/KKloudTarus/synapse-ce/internal/domain/alerting"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/asset"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/audit"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/aup"
@@ -101,6 +102,9 @@ type ScannedImageStore interface {
 type AssetRepository interface {
 	UpsertAsset(ctx context.Context, a *asset.Asset) error
 	GetAssetByKey(ctx context.Context, tenantID shared.ID, kind asset.Kind, key string) (*asset.Asset, error)
+	// GetAssetByID loads one asset by server-issued id, scoped to tenantID. A zero tenant or id is a
+	// validation error; a valid but absent or cross-tenant asset returns ErrNotFound.
+	GetAssetByID(ctx context.Context, tenantID, id shared.ID) (*asset.Asset, error)
 	ListAssets(ctx context.Context, tenantID shared.ID) ([]*asset.Asset, error)
 	UpsertEdge(ctx context.Context, e *asset.Edge) error
 	ListEdges(ctx context.Context, tenantID shared.ID) ([]*asset.Edge, error)
@@ -220,9 +224,15 @@ type QualityGateMutator interface {
 type ProjectAnalysisStore interface {
 	Save(ctx context.Context, analysis projectanalysis.Analysis) error
 	SaveWithResult(ctx context.Context, analysis projectanalysis.Analysis, result []byte) error
-	LatestWithResult(ctx context.Context, tenantID, projectID shared.ID) (projectanalysis.Analysis, []byte, error)
+	// LatestWithResult returns the newest completed analysis for the project. An empty branch means
+	// the latest across all branches; a non-empty branch restricts the result to that branch.
+	LatestWithResult(ctx context.Context, tenantID, projectID shared.ID, branch string) (projectanalysis.Analysis, []byte, error)
 	LatestForProjects(ctx context.Context, tenantID shared.ID, projectIDs []shared.ID) (map[shared.ID]projectanalysis.Analysis, error)
-	List(ctx context.Context, tenantID, projectID shared.ID, limit int, beforeCreatedAt time.Time, beforeID shared.ID) ([]projectanalysis.Analysis, bool, error)
+	// List pages a project's analysis history newest first. An empty branch means all branches; a
+	// non-empty branch restricts the page to analyses produced on that branch.
+	List(ctx context.Context, tenantID, projectID shared.ID, branch string, limit int, beforeCreatedAt time.Time, beforeID shared.ID) ([]projectanalysis.Analysis, bool, error)
+	// Branches returns the distinct non-deleted branch values recorded for the project, sorted.
+	Branches(ctx context.Context, tenantID, projectID shared.ID) ([]string, error)
 	Get(ctx context.Context, tenantID, projectID, analysisID shared.ID) (projectanalysis.Analysis, error)
 }
 
@@ -329,6 +339,9 @@ type EngagementRepository interface {
 	// It is only for Project use-case internals; normal engagement reads must use GetByIDInTenant.
 	GetByProjectID(ctx context.Context, tenantID, projectID shared.ID) (*engagement.Engagement, error)
 	ProjectContexts(ctx context.Context, tenantID shared.ID, projectIDs []shared.ID) (map[shared.ID]*engagement.Engagement, error)
+	// GetByHostAssetID loads the hidden fleet host vulnerability context for a Kind=host asset, scoped to
+	// tenantID. Only the host vulnerability use case reads it; normal engagement reads use GetByIDInTenant.
+	GetByHostAssetID(ctx context.Context, tenantID, assetID shared.ID) (*engagement.Engagement, error)
 	List(ctx context.Context, tenantID shared.ID) ([]*engagement.Engagement, error)
 	// Update persists changes to an existing engagement aggregate – its row
 	// (name/client/status/authorization window/timezone) and its full scope target
@@ -357,6 +370,12 @@ type EngagementOwnershipReader interface {
 // ProjectEngagementLister is an optional read extension for tenant-wide operational dashboards.
 type ProjectEngagementLister interface {
 	ListProjectEngagements(ctx context.Context, tenantID shared.ID) ([]*engagement.Engagement, error)
+}
+
+// HostEngagementLister returns the tenant's hidden fleet host vulnerability contexts, so a pass that
+// must visit every scanned SBOM (advisory-revision reconciliation) reaches hosts as well as projects.
+type HostEngagementLister interface {
+	ListHostEngagements(ctx context.Context, tenantID shared.ID) ([]*engagement.Engagement, error)
 }
 
 // GovernanceReconciler repairs durable governance side effects for one engagement.
@@ -890,6 +909,86 @@ type AITriageFindingDecision interface {
 type ImportedSBOMStore interface {
 	SaveActive(ctx context.Context, record importedsbom.Record) error
 	LatestByEngagement(ctx context.Context, tenantID, engagementID shared.ID) (importedsbom.Record, error)
+	// MetadataByEngagements returns the active record's metadata (no raw document) for each of the
+	// engagements that has one, in one round trip. A list view of many SBOM-bearing contexts must not
+	// pull every document body to show a component count and a digest.
+	MetadataByEngagements(ctx context.Context, tenantID shared.ID, engagementIDs []shared.ID) (map[shared.ID]importedsbom.Metadata, error)
+}
+
+// VulnerabilitySummary counts the advisory-backed findings of one engagement by severity.
+type VulnerabilitySummary struct {
+	Total    int `json:"total"`
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
+	Info     int `json:"info"`
+	Fixable  int `json:"fixable"`
+	KEV      int `json:"kev"`
+}
+
+// Add folds one finding's severity, fix state and KEV flag into the summary.
+func (s *VulnerabilitySummary) Add(severity shared.Severity, fixable, kev bool) {
+	s.Total++
+	switch severity {
+	case shared.SeverityCritical:
+		s.Critical++
+	case shared.SeverityHigh:
+		s.High++
+	case shared.SeverityMedium:
+		s.Medium++
+	case shared.SeverityLow:
+		s.Low++
+	default:
+		s.Info++
+	}
+	if fixable {
+		s.Fixable++
+	}
+	if kev {
+		s.KEV++
+	}
+}
+
+// AddCounts folds a pre-aggregated (severity, total, fixable, kev) group into the summary, for callers
+// that already have per-severity counts from a GROUP BY and must not replay Add once per finding.
+func (s *VulnerabilitySummary) AddCounts(severity shared.Severity, total, fixable, kev int) {
+	s.Total += total
+	switch severity {
+	case shared.SeverityCritical:
+		s.Critical += total
+	case shared.SeverityHigh:
+		s.High += total
+	case shared.SeverityMedium:
+		s.Medium += total
+	case shared.SeverityLow:
+		s.Low += total
+	default:
+		s.Info += total
+	}
+	s.Fixable += fixable
+	s.KEV += kev
+}
+
+// FindingSummaryReader aggregates SCA vulnerability findings per engagement in one read, for list
+// views over many engagements. License findings (dedup key "license:*") and non-SCA kinds are excluded.
+// Optional: a store that does not implement it makes callers fall back to listing findings.
+type FindingSummaryReader interface {
+	// SummarizeVulnerabilitiesByEngagements counts open SCA vulnerability findings per engagement:
+	// licence records and findings triaged false positive or remediated are excluded.
+	SummarizeVulnerabilitiesByEngagements(ctx context.Context, engagementIDs []shared.ID) (map[shared.ID]VulnerabilitySummary, error)
+	// SummarizeOpenFindingsByEngagements counts open findings of every kind (SCA, SAST, secrets, IaC,
+	// DAST, quality) per engagement with the same exclusions. It backs the engagement list's
+	// Findings column.
+	SummarizeOpenFindingsByEngagements(ctx context.Context, engagementIDs []shared.ID) (map[shared.ID]VulnerabilitySummary, error)
+}
+
+// AlertSink delivers one operator alert to a destination (a webhook, a chat integration). Deliver
+// returns an error when the destination did not acknowledge the alert; the caller decides whether that
+// is retried or only audited. Name identifies the sink in audit entries.
+type AlertSink interface {
+	Name() string
+	Deliver(ctx context.Context, alert alerting.Alert) error
 }
 
 // EvidenceStore appends to and reads the per-engagement hash-chained evidence
@@ -1773,6 +1872,32 @@ type SASTRawFinding struct {
 type SASTAnalyzer interface {
 	Name() string
 	AnalyzeSource(ctx context.Context, root string) ([]SASTRawFinding, error)
+}
+
+// SASTSourceReport is the bounded output of a deterministic SAST scan.
+//
+// Truncated means a safety cap (per-file finding budget, whole-tree finding budget, retained-source
+// budget, or an oversized line) stopped the scan, so Findings is a LOWER BOUND: a caller must not
+// read it as a clean result.
+//
+// SkippedFiles counts files the analyzer excluded by policy rather than by budget: a vendored
+// bundle, a minified asset, a generated source. That is a deliberate scope decision rather than a
+// failure, so it is reported separately instead of being folded into Truncated, which would be true
+// for every real repository and therefore mean nothing. A caller that needs to know the scan did not
+// cover the whole tree must look at both.
+type SASTSourceReport struct {
+	Findings     []SASTRawFinding
+	Truncated    bool
+	SkippedFiles int
+}
+
+// SASTSourceReporter is the optional completeness capability of a SASTAnalyzer. It exists so the
+// truncation flag reaches the caller without changing the SASTAnalyzer contract every adapter and
+// test double implements; callers type-assert it and treat a non-implementing analyzer as
+// "completeness unknown". Mirrors CodeAnalysisReport.Truncated on the code-quality path.
+type SASTSourceReporter interface {
+	SASTAnalyzer
+	AnalyzeSourceReport(ctx context.Context, root string) (SASTSourceReport, error)
 }
 
 // SecretRawFinding is one hardcoded-secret hit located at file:line in the scanned source. The Match is

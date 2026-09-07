@@ -5,8 +5,9 @@
 //
 // Coverage honesty is preserved: the inventory's coverage issues are recorded (count + degraded flag
 // on the asset, each issue audited), so a partial host inventory is never presented as complete. The
-// package LIST feeds the SCA vulnerability pipeline separately; the asset model records the host
-// identity, its facts, and a package count — it is not a package table.
+// asset model records the host identity, its facts, and a package count; the package LIST goes to the
+// optional VulnerabilityRecorder (the hostvuln use case), which records it as the host's SBOM and
+// queues the SCA vulnerability pipeline against it (#820).
 package hostinventory
 
 import (
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KKloudTarus/synapse-ce/internal/domain/asset"
 	dhi "github.com/KKloudTarus/synapse-ce/internal/domain/hostinventory"
@@ -23,16 +25,52 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/ports"
 )
 
+// MaxHostsPerAgent bounds how many distinct host assets one agent identity may create. An agent
+// reports the host it runs on; a machine-id change (reimage, cloned VM) legitimately makes a new one,
+// so the cap is a small multiple rather than one. Above it, a new key is refused: an agent varying its
+// facts must not mint host assets, hidden vulnerability contexts and scans without bound.
+const MaxHostsPerAgent = dhi.MaxHostsPerAgent
+
 // AssetWriter is the subset of the asset use case this service needs. The read is part of the
 // authorization boundary: an authenticated agent may update the host it already reports, but must
 // never silently take over a host natural key already owned by a different enrolled agent.
 type AssetWriter interface {
 	GetAssetByKey(ctx context.Context, tenantID shared.ID, kind asset.Kind, key string) (*asset.Asset, error)
 	UpsertAsset(ctx context.Context, actor string, in assetuc.UpsertAssetInput) (*asset.Asset, error)
+	ListAssets(ctx context.Context, tenantID shared.ID) ([]*asset.Asset, error)
 }
 
 // The concrete asset use case satisfies the consumer-side interface.
 var _ AssetWriter = (*assetuc.Service)(nil)
+
+// VulnerabilityRecorder turns the packages a host reported into CVE findings for that host (#820). The
+// concrete implementation lives in the hostvuln use case; this consumer-side interface keeps the
+// inventory path free of the SCA pipeline's types.
+type VulnerabilityRecorder interface {
+	Record(ctx context.Context, actor string, tenantID shared.ID, host *asset.Asset, inv dhi.HostInventory) (VulnerabilityOutcome, error)
+}
+
+// VulnerabilityOutcome reports what a sync did with the host's package list. Skipped with a Reason is
+// a normal outcome (no packages, or the package set is unchanged since the last recorded scan);
+// Failed marks a recorder error that was audited and did not fail the inventory sync.
+type VulnerabilityOutcome struct {
+	EngagementID shared.ID `json:"engagement_id,omitempty"`
+	JobID        string    `json:"job_id,omitempty"`
+	Components   int       `json:"components"`
+	Skipped      bool      `json:"skipped"`
+	Failed       bool      `json:"failed,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
+}
+
+// Reasons a sync records no new vulnerability scan.
+const (
+	ReasonNoPackages = "no packages reported"
+	ReasonUnchanged  = "package set unchanged since the last recorded scan"
+	ReasonScanActive = "a vulnerability scan is still running for this host; the next sync records the change"
+	// ReasonRecordedRecently: a different package set arrived within the minimum record interval.
+	ReasonRecordedRecently = "a package set was recorded for this host less than ten minutes ago; the next sync records the change"
+	ReasonQueueError       = "vulnerability scan could not be queued; see the audit log"
+)
 
 // Service maps and persists a host inventory.
 type Service struct {
@@ -40,7 +78,14 @@ type Service struct {
 	audit    ports.AuditLogger
 	clock    ports.Clock
 	bindings ports.TelemetryAssetBindingStore // optional; nil ⇒ no telemetry asset binding is established
+	vulns    VulnerabilityRecorder            // optional; nil ⇒ packages are counted but not correlated with advisories
 }
+
+// SetVulnerabilityRecorder wires the recorder that correlates the reported packages with advisories.
+// When set, every sync that carries packages records them as the host's SBOM and queues a
+// vulnerability scan; a recorder failure is audited and reported in the result, never returned, so a
+// host inventory is persisted even when the scan pipeline is unavailable.
+func (s *Service) SetVulnerabilityRecorder(r VulnerabilityRecorder) { s.vulns = r }
 
 // SetTelemetryBinder wires the server-authoritative agent→host telemetry binding store. When set, a
 // successful host-inventory sync establishes (or refreshes) the reporting agent's canonical telemetry
@@ -74,6 +119,8 @@ type SyncResult struct {
 	Complete bool
 	Degraded bool
 	Coverage int
+	// VulnerabilityScan is nil when no recorder is wired.
+	VulnerabilityScan *VulnerabilityOutcome
 }
 
 // Sync persists the host as a Kind=host asset. It is idempotent: two syncs of an unchanged host reuse
@@ -107,6 +154,14 @@ func (s *Service) Sync(ctx context.Context, actor string, in SyncInput) (*SyncRe
 		Attributes: attributes(inv, degraded, actor),
 	})
 	if err != nil {
+		if errors.Is(err, shared.ErrForbidden) {
+			// The store's own cap check refused the row: two syncs from this agent raced past
+			// guardHostsPerAgent and the transaction-level backstop caught the second. Audit it the
+			// same way so the refusal stays attributable.
+			if aerr := s.auditHostCap(ctx, actor, in.TenantID, key, MaxHostsPerAgent); aerr != nil {
+				return nil, aerr
+			}
+		}
 		return nil, fmt.Errorf("host inventory: upsert host asset: %w", err)
 	}
 
@@ -157,7 +212,42 @@ func (s *Service) Sync(ctx context.Context, actor string, in SyncInput) (*SyncRe
 		}
 	}
 
-	return &SyncResult{AssetID: a.ID, Complete: inv.Complete, Degraded: degraded, Coverage: len(inv.Coverage)}, nil
+	res := &SyncResult{AssetID: a.ID, Complete: inv.Complete, Degraded: degraded, Coverage: len(inv.Coverage)}
+	if s.vulns != nil {
+		outcome, err := s.recordVulnerabilities(ctx, actor, in.TenantID, a, inv, now)
+		if err != nil {
+			return nil, err
+		}
+		res.VulnerabilityScan = &outcome
+	}
+	return res, nil
+}
+
+// recordVulnerabilities hands the package list to the recorder. The inventory is already persisted,
+// so a recorder failure is audited with the cause and reported as a failed outcome rather than
+// undoing the sync; the agent resends the inventory on its next sweep and the scan is retried then.
+// Only an audit failure is returned, because an unattributable failure is the one thing this path
+// must not swallow.
+func (s *Service) recordVulnerabilities(ctx context.Context, actor string, tenantID shared.ID, a *asset.Asset, inv dhi.HostInventory, now time.Time) (VulnerabilityOutcome, error) {
+	outcome, err := s.vulns.Record(ctx, actor, tenantID, a, inv)
+	if err == nil {
+		return outcome, nil
+	}
+	if aerr := s.audit.Record(ctx, ports.AuditEntry{
+		Actor:  actor,
+		Action: "host_inventory.vulnerability_scan_failed",
+		Target: a.ID.String(),
+		Metadata: map[string]string{
+			"tenant_id": tenantID.String(),
+			"asset_id":  a.ID.String(),
+			"packages":  strconv.Itoa(len(inv.Packages)),
+			"error":     err.Error(),
+		},
+		At: now,
+	}); aerr != nil {
+		return VulnerabilityOutcome{}, fmt.Errorf("host inventory: audit vulnerability scan failure: %w", aerr)
+	}
+	return VulnerabilityOutcome{Components: len(inv.Packages), Skipped: true, Failed: true, Reason: ReasonQueueError}, nil
 }
 
 // guardAssetBinding prevents an authenticated agent from claiming the stable natural key of a host that
@@ -168,7 +258,7 @@ func (s *Service) guardAssetBinding(ctx context.Context, actor string, tenantID 
 	existing, err := s.assets.GetAssetByKey(ctx, tenantID, asset.KindHost, key)
 	switch {
 	case errors.Is(err, shared.ErrNotFound):
-		return nil
+		return s.guardHostsPerAgent(ctx, actor, tenantID, key)
 	case err != nil:
 		return fmt.Errorf("host inventory: lookup host asset: %w", err)
 	}
@@ -214,6 +304,49 @@ func (s *Service) guardAssetBinding(ctx context.Context, actor string, tenantID 
 	return fmt.Errorf("%w: host asset %s is already bound to agent %s", shared.ErrConflict, existing.ID, oldAgent)
 }
 
+// guardHostsPerAgent refuses a NEW host key once the reporting agent already owns MaxHostsPerAgent
+// hosts. It runs only when the key is new, so the O(assets) scan is paid on host creation, not on
+// every sync. The refusal is audited so a misbehaving or compromised agent is attributable.
+func (s *Service) guardHostsPerAgent(ctx context.Context, actor string, tenantID shared.ID, key string) error {
+	all, err := s.assets.ListAssets(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("host inventory: count agent hosts: %w", err)
+	}
+	owned := 0
+	for _, a := range all {
+		if a.Kind == asset.KindHost && strings.TrimSpace(a.Attributes["reporting_agent_id"]) == actor {
+			owned++
+		}
+	}
+	if owned < MaxHostsPerAgent {
+		return nil
+	}
+	if err := s.auditHostCap(ctx, actor, tenantID, key, owned); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: agent %s already reports %d hosts; a new host key is refused", shared.ErrForbidden, actor, owned)
+}
+
+// auditHostCap records a refused host key. owned is the count the refusing side observed: the use
+// case's own count on the fast path, the cap itself when the store's transactional check refused.
+func (s *Service) auditHostCap(ctx context.Context, actor string, tenantID shared.ID, key string, owned int) error {
+	if err := s.audit.Record(ctx, ports.AuditEntry{
+		Actor:  actor,
+		Action: "host_inventory.host_cap_reached",
+		Target: key,
+		Metadata: map[string]string{
+			"tenant_id": tenantID.String(),
+			"asset_key": key,
+			"hosts":     strconv.Itoa(owned),
+			"cap":       strconv.Itoa(MaxHostsPerAgent),
+		},
+		At: s.clock.Now(),
+	}); err != nil {
+		return fmt.Errorf("host inventory: audit host cap: %w", err)
+	}
+	return nil
+}
+
 // hostKey is the host's stable natural key: the machine id when known (survives hostname changes),
 // else a hostname-derived key, else empty (unidentifiable).
 func hostKey(f dhi.HostFacts) string {
@@ -247,6 +380,20 @@ func attributes(inv dhi.HostInventory, degraded bool, reportingAgent string) map
 		"degraded":           strconv.FormatBool(degraded),
 		"coverage_gaps":      strconv.Itoa(len(inv.Coverage)),
 		"reporting_agent_id": strings.TrimSpace(reportingAgent),
+	}
+	// The gaps themselves, not only their count, so the host page can say what was not inventoried
+	// and why. One kind per issue, comma separated; details newline separated as "kind: detail".
+	if len(inv.Coverage) > 0 {
+		kinds := make([]string, 0, len(inv.Coverage))
+		details := make([]string, 0, len(inv.Coverage))
+		for _, c := range inv.Coverage {
+			kinds = append(kinds, string(c.Kind))
+			if c.Detail != "" {
+				details = append(details, string(c.Kind)+": "+c.Detail)
+			}
+		}
+		attrs["coverage_gap_kinds"] = strings.Join(kinds, ",")
+		attrs["coverage_gap_details"] = strings.Join(details, "\n")
 	}
 	// Drop empty fact values so the asset attributes stay clean.
 	for k, v := range attrs {

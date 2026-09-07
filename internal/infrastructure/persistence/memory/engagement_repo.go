@@ -31,6 +31,7 @@ var _ ports.PromotionReconciliationScopeReader = (*EngagementRepository)(nil)
 var _ ports.VulnerabilityReconciliationTenantStore = (*EngagementRepository)(nil)
 var _ ports.DetectionReconciliationTenantStore = (*EngagementRepository)(nil)
 var _ ports.VulnerabilityReconciliationEngagementStore = (*EngagementRepository)(nil)
+var _ ports.HostEngagementLister = (*EngagementRepository)(nil)
 
 func (r *EngagementRepository) Create(_ context.Context, e *engagement.Engagement) error {
 	r.mu.Lock()
@@ -60,10 +61,25 @@ func (r *EngagementRepository) GetByIDInTenant(_ context.Context, tenantID, id s
 	if !ok {
 		return nil, shared.ErrNotFound
 	}
-	if !e.ProjectID.IsZero() || e.TenantID != tenantID {
+	if e.Internal() || e.TenantID != tenantID {
 		return nil, shared.ErrNotFound // cross-tenant/internal access – do not reveal existence
 	}
 	return e, nil
+}
+
+func (r *EngagementRepository) GetByHostAssetID(_ context.Context, tenantID, assetID shared.ID) (*engagement.Engagement, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	tenantID = shared.TenantOrDefault(tenantID)
+	if assetID.IsZero() {
+		return nil, shared.ErrNotFound
+	}
+	for _, e := range r.data {
+		if e.HostAssetID == assetID && e.TenantID == tenantID {
+			return e, nil
+		}
+	}
+	return nil, shared.ErrNotFound
 }
 
 func (r *EngagementRepository) GetByProjectID(_ context.Context, tenantID, projectID shared.ID) (*engagement.Engagement, error) {
@@ -126,7 +142,7 @@ func (r *EngagementRepository) ListPromotionReconciliationScopes(ctx context.Con
 	defer r.mu.RUnlock()
 	out := make([]ports.PromotionReconciliationScope, 0, len(r.data))
 	for _, e := range r.data {
-		if !e.ProjectID.IsZero() {
+		if e.Internal() {
 			continue
 		}
 		out = append(out, ports.PromotionReconciliationScope{
@@ -143,7 +159,7 @@ func (r *EngagementRepository) List(_ context.Context, tenantID shared.ID) ([]*e
 	tenantID = shared.TenantOrDefault(tenantID)
 	out := make([]*engagement.Engagement, 0, len(r.data))
 	for _, e := range r.data {
-		if e.ProjectID.IsZero() && e.TenantID == tenantID {
+		if !e.Internal() && e.TenantID == tenantID {
 			out = append(out, e)
 		}
 	}
@@ -157,6 +173,20 @@ func (r *EngagementRepository) ListProjectEngagements(_ context.Context, tenantI
 	out := make([]*engagement.Engagement, 0)
 	for _, e := range r.data {
 		if !e.ProjectID.IsZero() && e.TenantID == tenantID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// ListHostEngagements returns the tenant's hidden host vulnerability contexts.
+func (r *EngagementRepository) ListHostEngagements(_ context.Context, tenantID shared.ID) ([]*engagement.Engagement, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	tenantID = shared.TenantOrDefault(tenantID)
+	out := make([]*engagement.Engagement, 0)
+	for _, e := range r.data {
+		if !e.HostAssetID.IsZero() && e.TenantID == tenantID {
 			out = append(out, e)
 		}
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -62,6 +63,17 @@ func resolveSweepInterval(d time.Duration) time.Duration {
 // re-sweeps every interval until the context is cancelled. It blocks; startInventorySweep runs it in a
 // goroutine.
 func (r *runner) runSweepLoop(ctx context.Context, cred fleetclient.Credential, interval time.Duration) {
+	// De-synchronize the fleet: without an initial jitter every agent restarted together (a rollout or a
+	// control-plane restart) sweeps and reports at the same instant, and the process-report write path
+	// would drain the server's connection pool as a herd. A random delay up to one minute (or the
+	// interval, whichever is smaller) spreads the first sweep. Steady-state ticks stay on the cadence.
+	if jitter := sweepBootJitter(interval); jitter > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(jitter):
+		}
+	}
 	r.sweepOnce(ctx, cred)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -87,7 +99,26 @@ func (r *runner) sweepOnce(ctx context.Context, cred fleetclient.Credential) {
 		log.Printf("inventory sweep: collect: %v", err)
 		return
 	}
-	if err := r.api.SendHostInventory(ctx, cred.Token, inv); err != nil {
+	// Use the resolved response path so the sweep learns the canonical asset id the control plane
+	// reconciled for this host, and persist it.
+	//
+	// Without this the whole telemetry and detection half of the agent never starts. The run loop
+	// gates the transport on cred.AssetID, that field was written only from the work-order branch,
+	// and nothing in the product can issue a work order, so a stock agent enrolled, swept inventory
+	// hourly, and never shipped a single detection. The server-side binding was already being made
+	// by this same request; only the agent's copy of it was being thrown away.
+	if resolved, ok := r.api.(hostInventoryResolvedAPI); ok {
+		resp, reportErr := resolved.SendHostInventoryResolved(ctx, cred.Token, inv)
+		if reportErr != nil {
+			log.Printf("inventory sweep: report inventory: %v", reportErr)
+			return
+		}
+		if resp.AssetID != "" && resp.AssetID != cred.AssetID {
+			if _, err := r.store.PersistAssetBinding(cred, resp.AssetID); err != nil {
+				log.Printf("inventory sweep: persist canonical asset binding: %v", err)
+			}
+		}
+	} else if err := r.api.SendHostInventory(ctx, cred.Token, inv); err != nil {
 		log.Printf("inventory sweep: report inventory: %v", err)
 		return
 	}
@@ -96,4 +127,21 @@ func (r *runner) sweepOnce(ctx context.Context, cred fleetclient.Credential) {
 	if inv.Degraded() {
 		log.Print("inventory sweep: shipped a DEGRADED inventory (package data incomplete); coverage recorded server-side")
 	}
+	// The inventory report bound (or refreshed) this host's canonical asset, so the server can now resolve
+	// a process report to it. Ship the running-process snapshot for the behavior baseline (#594 D).
+	r.reportProcesses(ctx, cred)
+}
+
+// sweepBootJitter returns a random initial delay in [0, min(interval, 1 minute)) to spread the first
+// sweep of a fleet that restarted together. Zero when the interval is zero (tests that want a prompt
+// sweep pass an interval and get at most a sub-minute delay; a one-shot run never reaches here).
+func sweepBootJitter(interval time.Duration) time.Duration {
+	cap := time.Minute
+	if interval < cap {
+		cap = interval
+	}
+	if cap <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(cap)))
 }

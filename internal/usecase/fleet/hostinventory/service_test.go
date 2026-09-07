@@ -3,6 +3,7 @@ package hostinventory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,11 +16,12 @@ import (
 )
 
 type fakeAssetWriter struct {
-	ids     map[string]shared.ID
-	assets  map[string]*asset.Asset
-	next    int
-	upserts int
-	last    assetuc.UpsertAssetInput
+	ids       map[string]shared.ID
+	assets    map[string]*asset.Asset
+	next      int
+	upserts   int
+	last      assetuc.UpsertAssetInput
+	upsertErr error // returned by UpsertAsset when set: the store refused the write
 }
 
 func newFakeWriter() *fakeAssetWriter {
@@ -39,6 +41,9 @@ func (f *fakeAssetWriter) GetAssetByKey(_ context.Context, _ shared.ID, kind ass
 func (f *fakeAssetWriter) UpsertAsset(_ context.Context, _ string, in assetuc.UpsertAssetInput) (*asset.Asset, error) {
 	f.upserts++
 	f.last = in
+	if f.upsertErr != nil {
+		return nil, f.upsertErr
+	}
 	k := string(in.Kind) + "|" + in.Key
 	id, ok := f.ids[k]
 	if !ok {
@@ -51,6 +56,16 @@ func (f *fakeAssetWriter) UpsertAsset(_ context.Context, _ string, in assetuc.Up
 	copyAsset := *a
 	copyAsset.Attributes = cloneStringMap(a.Attributes)
 	return &copyAsset, nil
+}
+
+func (f *fakeAssetWriter) ListAssets(_ context.Context, _ shared.ID) ([]*asset.Asset, error) {
+	out := make([]*asset.Asset, 0, len(f.assets))
+	for _, a := range f.assets {
+		copyAsset := *a
+		copyAsset.Attributes = cloneStringMap(a.Attributes)
+		out = append(out, &copyAsset)
+	}
+	return out, nil
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
@@ -176,6 +191,13 @@ func TestSyncCoverageAuditedAndDegraded(t *testing.T) {
 	}
 	if a.gaps != 2 {
 		t.Fatalf("every coverage gap must be audited, got %d", a.gaps)
+	}
+	// The domain keeps issues sorted by kind, so the attributes are deterministic across syncs.
+	if got := w.last.Attributes["coverage_gap_kinds"]; got != "not-collected,unreadable-package-db" {
+		t.Fatalf("coverage_gap_kinds = %q", got)
+	}
+	if got := w.last.Attributes["coverage_gap_details"]; got != "not-collected: listening-sockets\nunreadable-package-db: /var/lib/rpm unreadable" {
+		t.Fatalf("coverage_gap_details = %q", got)
 	}
 	if w.last.Attributes["degraded"] != "true" {
 		t.Fatalf("the host asset must record degraded=true, got %v", w.last.Attributes)
@@ -334,5 +356,143 @@ func TestSyncFailsWhenBindingConflicts(t *testing.T) {
 	s.SetTelemetryBinder(&fakeBinder{errOn: shared.ErrConflict})
 	if _, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: completeHost()}); !errors.Is(err, shared.ErrConflict) {
 		t.Fatalf("a binding conflict must fail the sync, got %v", err)
+	}
+}
+
+// fakeRecorder is the vulnerability recorder the sync hands the package list to.
+type fakeRecorder struct {
+	calls   int
+	last    dhi.HostInventory
+	lastID  shared.ID
+	actor   string
+	outcome VulnerabilityOutcome
+	err     error
+}
+
+func (f *fakeRecorder) Record(_ context.Context, actor string, _ shared.ID, host *asset.Asset, inv dhi.HostInventory) (VulnerabilityOutcome, error) {
+	f.calls++
+	f.actor, f.lastID, f.last = actor, host.ID, inv
+	if f.err != nil {
+		return VulnerabilityOutcome{}, f.err
+	}
+	return f.outcome, nil
+}
+
+// With a recorder wired, a sync hands the persisted host and its packages to the recorder and reports
+// the recorder's outcome. The actor is the authenticated agent, never anything from the inventory.
+func TestSyncRecordsPackagesForVulnerabilityCorrelation(t *testing.T) {
+	w := newFakeWriter()
+	s := newService(t, w, &fakeAudit{})
+	rec := &fakeRecorder{outcome: VulnerabilityOutcome{EngagementID: "ctx-1", JobID: "job-1", Components: 2}}
+	s.SetVulnerabilityRecorder(rec)
+
+	res, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: completeHost()})
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if rec.calls != 1 || rec.actor != "agent-1" || rec.lastID != res.AssetID || len(rec.last.Packages) != 2 {
+		t.Fatalf("recorder call = %+v", rec)
+	}
+	if res.VulnerabilityScan == nil || res.VulnerabilityScan.JobID != "job-1" || res.VulnerabilityScan.EngagementID != "ctx-1" {
+		t.Fatalf("result outcome = %+v", res.VulnerabilityScan)
+	}
+}
+
+// A recorder failure is audited with its cause and reported in the result; the inventory sync itself
+// succeeded and must not be reported as failed to the agent.
+func TestSyncAuditsRecorderFailureWithoutFailingTheSync(t *testing.T) {
+	audit := &fakeAudit{}
+	s := newService(t, newFakeWriter(), audit)
+	s.SetVulnerabilityRecorder(&fakeRecorder{err: errors.New("queue unavailable")})
+
+	res, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: completeHost()})
+	if err != nil {
+		t.Fatalf("recorder failure must not fail the sync: %v", err)
+	}
+	if res.VulnerabilityScan == nil || !res.VulnerabilityScan.Failed || !res.VulnerabilityScan.Skipped || res.VulnerabilityScan.Reason != ReasonQueueError || res.VulnerabilityScan.Components != 2 {
+		t.Fatalf("failed outcome = %+v", res.VulnerabilityScan)
+	}
+	e, ok := audit.entry("host_inventory.vulnerability_scan_failed")
+	if !ok {
+		t.Fatalf("failure not audited: %+v", audit.entries)
+	}
+	if e.Actor != "agent-1" || e.Target != res.AssetID.String() || e.Metadata["error"] != "queue unavailable" || e.Metadata["packages"] != "2" {
+		t.Fatalf("failure audit = %+v", e)
+	}
+}
+
+// Without a recorder the sync is unchanged: no outcome, packages only counted.
+func TestSyncWithoutRecorderReportsNoScan(t *testing.T) {
+	s := newService(t, newFakeWriter(), &fakeAudit{})
+	res, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: completeHost()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.VulnerabilityScan != nil {
+		t.Fatalf("outcome without recorder = %+v", res.VulnerabilityScan)
+	}
+}
+
+// One agent identity may create MaxHostsPerAgent hosts; the next new key is refused and audited, while
+// re-syncing an existing host is unaffected.
+func TestSyncCapsHostsPerAgent(t *testing.T) {
+	w := newFakeWriter()
+	audit := &fakeAudit{}
+	s := newService(t, w, audit)
+	for i := 0; i < MaxHostsPerAgent; i++ {
+		inv := dhi.HostInventory{Facts: dhi.HostFacts{Hostname: "h", OS: "linux", MachineID: "id-" + itoa(i)}}
+		if _, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: inv}); err != nil {
+			t.Fatalf("host %d: %v", i, err)
+		}
+	}
+	extra := dhi.HostInventory{Facts: dhi.HostFacts{Hostname: "h", OS: "linux", MachineID: "id-extra"}}
+	if _, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: extra}); !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("host beyond the cap accepted: %v", err)
+	}
+	if _, ok := audit.entry("host_inventory.host_cap_reached"); !ok {
+		t.Fatalf("cap refusal not audited: %+v", audit.entries)
+	}
+	// An existing host still syncs.
+	again := dhi.HostInventory{Facts: dhi.HostFacts{Hostname: "h", OS: "linux", MachineID: "id-0"}}
+	if _, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: again}); err != nil {
+		t.Fatalf("existing host refused: %v", err)
+	}
+	// Another agent has its own budget.
+	other := dhi.HostInventory{Facts: dhi.HostFacts{Hostname: "h", OS: "linux", MachineID: "id-other"}}
+	if _, err := s.Sync(context.Background(), "agent-2", SyncInput{TenantID: "tenant-1", Inventory: other}); err != nil {
+		t.Fatalf("second agent refused: %v", err)
+	}
+}
+
+// TestSyncAuditsTheStoreCapBackstop covers the race the count-then-write check cannot close on its
+// own: two syncs from one agent both count below the cap, and the store's transactional check (the
+// fleet_assets trigger in Postgres, the store lock in memory) refuses the second row. The refusal is
+// audited like the fast-path one and surfaces as forbidden, never as an opaque write error.
+func TestSyncAuditsTheStoreCapBackstop(t *testing.T) {
+	w := newFakeWriter()
+	w.upsertErr = fmt.Errorf("%w: agent agent-1 already reports the maximum number of hosts", shared.ErrForbidden)
+	audit := &fakeAudit{}
+	s := newService(t, w, audit)
+
+	_, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: completeHost()})
+	if !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("err = %v, want forbidden", err)
+	}
+	e, ok := audit.entry("host_inventory.host_cap_reached")
+	if !ok {
+		t.Fatalf("store refusal not audited: %+v", audit.entries)
+	}
+	if e.Actor != "agent-1" || e.Metadata["asset_key"] != "machine-id/abc123" || e.Metadata["cap"] != itoa(MaxHostsPerAgent) || e.Metadata["hosts"] != itoa(MaxHostsPerAgent) {
+		t.Fatalf("audit entry = %+v", e)
+	}
+
+	// Any other store failure is a plain error: no cap audit, no forbidden.
+	w.upsertErr = errors.New("connection reset")
+	audit.entries = nil
+	if _, err := s.Sync(context.Background(), "agent-1", SyncInput{TenantID: "tenant-1", Inventory: completeHost()}); err == nil || errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("err = %v, want a plain store error", err)
+	}
+	if _, ok := audit.entry("host_inventory.host_cap_reached"); ok {
+		t.Fatalf("a plain store error was audited as a cap refusal: %+v", audit.entries)
 	}
 }

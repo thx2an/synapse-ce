@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/domain/agent"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/asset"
 	ap "github.com/KKloudTarus/synapse-ce/internal/domain/attackpath"
+	"github.com/KKloudTarus/synapse-ce/internal/domain/dastrun"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/detection"
 	engdom "github.com/KKloudTarus/synapse-ce/internal/domain/engagement"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/finding"
@@ -23,22 +26,27 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/domain/rule"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/shared"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/threatmodel"
+	userdom "github.com/KKloudTarus/synapse-ce/internal/domain/user"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/writeupdraft"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/persistence/memory"
 	analysisuc "github.com/KKloudTarus/synapse-ce/internal/usecase/analysis"
 	attackpathuc "github.com/KKloudTarus/synapse-ce/internal/usecase/attackpath"
+	chainrehearsaluc "github.com/KKloudTarus/synapse-ce/internal/usecase/chainrehearsal"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/dastrunner"
 	dastverifieruc "github.com/KKloudTarus/synapse-ce/internal/usecase/dastverifier"
 	dastworkflowuc "github.com/KKloudTarus/synapse-ce/internal/usecase/dastworkflow"
 	enguc "github.com/KKloudTarus/synapse-ce/internal/usecase/engagement"
 	evidenceuc "github.com/KKloudTarus/synapse-ce/internal/usecase/evidence"
 	coverageuc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/coverage"
+	hostvulnuc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/hostvuln"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/fleetrolloutuc"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/ports"
 	projectuc "github.com/KKloudTarus/synapse-ce/internal/usecase/projectuc"
 	promotionuc "github.com/KKloudTarus/synapse-ce/internal/usecase/promotion"
+	purpleteamuc "github.com/KKloudTarus/synapse-ce/internal/usecase/purpleteam"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/rules"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/sarifingest"
+	scauc "github.com/KKloudTarus/synapse-ce/internal/usecase/sca"
 	usersuc "github.com/KKloudTarus/synapse-ce/internal/usecase/users"
 )
 
@@ -169,6 +177,24 @@ func (harnessDetections) Incidents(_ context.Context, _ shared.ID) ([]detection.
 // harnessPurple is the #426 purple-coverage read side: it returns one tenant-A coverage record carrying a
 // marker technique, so the harness proves a cross-tenant read (blocked by withEngTenant → 404) never
 // reaches it, while a same-tenant read does.
+// harnessFindingLister adapts the memory finding repository to the host vulnerability lister.
+type harnessFindingLister struct{ repo *memory.FindingRepository }
+
+func (l harnessFindingLister) List(ctx context.Context, engagementID shared.ID) ([]finding.Finding, error) {
+	return l.repo.ListByEngagement(ctx, engagementID)
+}
+
+// harnessSBOMScanner satisfies the recorder's scanner; the harness only reads.
+type harnessSBOMScanner struct{}
+
+func (harnessSBOMScanner) ImportContextSBOM(context.Context, string, shared.ID, shared.ID, string, []byte) (*scauc.ScanResult, error) {
+	return &scauc.ScanResult{}, nil
+}
+
+func (harnessSBOMScanner) StartScanWithOptions(context.Context, string, shared.ID, ports.AcquireRequest, scauc.ScanOptions) (ports.ScanJob, error) {
+	return ports.ScanJob{}, nil
+}
+
 type harnessPurple struct{}
 
 func (harnessPurple) Trend(_ context.Context, engagementID shared.ID) ([]purplecoverage.Coverage, error) {
@@ -201,6 +227,37 @@ func (fakeDASTWorkflow) Decide(context.Context, string, shared.ID, shared.ID, bo
 }
 func (fakeDASTWorkflow) Run(context.Context, string, shared.ID, shared.ID, dastrunner.Probe) (dastrunner.Result, error) {
 	return dastrunner.Result{}, nil
+}
+
+// fakeChainRehearser backs the exploitation chain-rehearsal route so the harness guards its operate +
+// tenant gates. A cross-tenant caller is rejected by withEngTenant before this runs.
+type fakeChainRehearser struct{}
+
+func (fakeChainRehearser) RunChain(context.Context, shared.ID, shared.ID, string, []chainrehearsaluc.StepSpec) (chainrehearsaluc.Result, error) {
+	return chainrehearsaluc.Result{}, nil
+}
+
+// fakeDASTRunner backs the durable DAST run status route. It holds one run owned by tenantA/engA and is
+// tenant-scoped like the real store, so the harness can prove the read route rejects a cross-tenant caller
+// (through withEngTenant) and a machine role (through the view gate).
+// fakePurpleTeam backs the #426 adversary-emulation producer route so the harness guards its operate +
+// tenant gates. A cross-tenant caller is rejected by withEngTenant before this runs.
+type fakePurpleTeam struct{}
+
+func (fakePurpleTeam) RunEmulation(context.Context, shared.ID, shared.ID, shared.ID, string) (purpleteamuc.Result, error) {
+	return purpleteamuc.Result{}, nil
+}
+
+type fakeDASTRunner struct{}
+
+func (fakeDASTRunner) Submit(context.Context, shared.ID, shared.ID, string, dastrunner.Probe) (dastrun.Run, error) {
+	return dastrun.Run{}, nil
+}
+func (fakeDASTRunner) GetRun(_ context.Context, tenantID, runID shared.ID) (dastrun.Run, error) {
+	if tenantID == "tenantA" && runID == "dast-run-a" {
+		return dastrun.Run{ID: "dast-run-a", TenantID: "tenantA", EngagementID: "engA", ActionID: "act-a", Actor: "operator", Status: dastrun.RunSucceeded, Verdict: "confirmed", HTTPStatus: 200, EvidenceID: "ev-a", StartedAt: time.Unix(1_700_000_000, 0).UTC()}, nil
+	}
+	return dastrun.Run{}, fmt.Errorf("%w: DAST run", shared.ErrNotFound)
 }
 
 type fakeThreatModel struct{}
@@ -329,6 +386,12 @@ func TestHostileHarness(t *testing.T) {
 	}
 	projectRepo := memory.NewProjectRepository()
 	projectSvc := projectuc.NewService(projectRepo, engRepo, fixedClock{}, engIDs{}, &fakeAudit{}, true)
+	// The measures route signs its pagination cursor, and refuses to serve at all without a key.
+	// The generated sweep below must reach the tenant check on that route rather than stopping at
+	// an unconfigured-deployment error.
+	if err := projectSvc.SetCursorSecret([]byte(strings.Repeat("harness-cursor-secret", 3))); err != nil {
+		t.Fatalf("set measure cursor secret: %v", err)
+	}
 	if _, err := projectSvc.Create(context.Background(), projectuc.CreateInput{
 		TenantID: "tenantA", CreatedBy: "p", Name: "Project A", Key: "project-a",
 		SourceBinding: projectdom.SourceBinding{Kind: projectdom.SourceLocal, Value: "/repo"},
@@ -338,9 +401,22 @@ func TestHostileHarness(t *testing.T) {
 	analysisStore := memory.NewProjectAnalysisStore()
 	projectSvc.SetHotspotStore(analysisStore)
 	projectSvc.SetAnalysisStore(analysisStore)
-	usersSvc, err := usersuc.NewService(memory.NewUserRepository(), &fakeAudit{}, fixedClock{}, engIDs{})
+	usersSvc, err := usersuc.NewService(memory.NewUserRepository(), &fakeAudit{}, fixedClock{}, &seqIDs{})
 	if err != nil {
 		t.Fatalf("users svc: %v", err)
+	}
+	// One admin per tenant, plus a tenantB member, so the roster read below can prove that a
+	// tenantB admin never observes tenantA's operators.
+	platform := usersuc.Actor{ID: usersuc.BootstrapID}
+	tenantAAdmin, _, err := usersSvc.CreateUser(context.Background(), platform, "tenantA", "A Admin", userdom.RoleAdmin)
+	if err != nil {
+		t.Fatalf("seed tenantA admin: %v", err)
+	}
+	if _, _, err := usersSvc.CreateUser(context.Background(), platform, "tenantB", "B Admin", userdom.RoleAdmin); err != nil {
+		t.Fatalf("seed tenantB admin: %v", err)
+	}
+	if _, _, err := usersSvc.CreateUser(context.Background(), platform, "tenantB", "B Member", userdom.RoleMember); err != nil {
+		t.Fatalf("seed tenantB member: %v", err)
 	}
 	rt := &Router{
 		log:      discardLog(),
@@ -350,12 +426,14 @@ func TestHostileHarness(t *testing.T) {
 	}
 	// Register the two CONDITIONAL sign-off routes so the harness guards their gates too: the
 	// PermReview /verify route (needs a non-nil exploitation verifier) and the agent routes incl.
-	// PermReview approval-decide (needs a non-nil agent – nil deps are fine because every assertion
-	// below on these routes is a DENY that authz/withEngTenant reject before any handler runs).
+	// PermReview approval-decide. The deps that the generated sweep actually reads are real; the
+	// rest stay nil because every assertion on those routes is a DENY that authz or withEngTenant
+	// rejects before any handler runs.
 	rt.SetExploitation(&fakeVerifier{})
 	rt.SetJudgments(promotionAnalysis) // real judgment/promotion lifecycle for hostile verification coverage
 	rt.SetRuntimeVerifier(&fakeRuntimeVerifier{})
 	rt.SetDASTWorkflow(&fakeDASTWorkflow{})
+	rt.SetDASTRunner(fakeDASTRunner{})        // register the #823 durable DAST run status route so the harness guards its view + tenant gates
 	rt.SetThreatModel(&fakeThreatModel{})     // register the threat-model ingest/read routes so the harness guards their gates
 	rt.SetWriteupDrafts(&fakeWriteupDrafts{}) // register the writeup-draft sign-off routes so the harness guards their SoD gates
 	rt.SetAITriageReviews(&aiReviewFake{})    // register AI-triage queue read/claim/decision routes
@@ -367,8 +445,38 @@ func TestHostileHarness(t *testing.T) {
 	rt.SetVulnerabilityAudit(audit)
 	rt.SetDetectionReader(harnessDetections{})  // register the #423 detection-ledger read route
 	rt.SetPurpleCoverageReader(harnessPurple{}) // register the #426 purple-coverage read route
+	rt.SetPurpleTeam(fakePurpleTeam{})          // register the #426 adversary-emulation producer route
+	rt.SetChainRehearsal(fakeChainRehearser{})  // register the exploitation chain-rehearsal route
+	// #820 host vulnerabilities: the real use case over tenantA's host asset, its hidden context and one
+	// finding, so a cross-tenant read of the host routes is proven empty rather than assumed.
+	hostAsset := &asset.Asset{ID: "host-A", TenantID: "tenantA", Kind: asset.KindHost, Key: "machine-id/host-A", Name: "host-A", Attributes: map[string]string{"os": "linux"}}
+	if err := attackAssets.UpsertAsset(context.Background(), hostAsset); err != nil {
+		t.Fatalf("seed host asset: %v", err)
+	}
+	if err := engRepo.Create(context.Background(), &engdom.Engagement{
+		ID: "hostctx-A", TenantID: "tenantA", HostAssetID: "host-A", Name: "host-A host vulnerabilities", Status: engdom.StatusDraft,
+	}); err != nil {
+		t.Fatalf("seed host context: %v", err)
+	}
+	hostFindings := memory.NewFindingRepository()
+	if err := hostFindings.Upsert(promotionCtx, []finding.Finding{{
+		ID: "hostvuln-A", EngagementID: "hostctx-A", Kind: finding.KindSCA, Severity: shared.SeverityHigh, Status: finding.StatusOpen,
+		Title: "CVE-2026-0001 in openssl@1.0", DedupKey: "vuln:CVE-2026-0001:openssl:1.0", Priority: 3, Version: 1,
+		Audit: shared.Audit{CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)},
+	}}); err != nil {
+		t.Fatalf("seed host finding: %v", err)
+	}
+	hostVulns, err := hostvulnuc.NewService(engRepo, attackAssets, harnessFindingLister{repo: hostFindings}, harnessSBOMScanner{}, memory.NewImportedSBOMStore(), memory.NewScanJobStore(), engIDs{}, fixedClock{t: time.Unix(1, 0)}, audit)
+	if err != nil {
+		t.Fatalf("host vulnerability service: %v", err)
+	}
+	rt.SetHostVulnerabilities(hostVulns)
 	rt.SetFleetRolloutAdmin(harnessRollout{})
-	rt.EnableAgent(nil, nil, nil, nil, nil, 1, 8)
+	// A real approval store, not nil: the generated sweep below reads the approvals route as the
+	// owning tenant, so the handler must run rather than dereference a nil dependency.
+	rt.EnableAgent(nil, memory.NewAgentSessionStore(), nil, memory.NewApprovalStore(), nil, 1, 8)
+	rt.SetAgentPlanStore(memory.NewPlanStore())
+	rt.SetAgentDecisionStore(memory.NewDecisionStore())
 	mux := rt.routes()
 
 	send := func(role, tenant, method, path string, authed bool) (int, string) {
@@ -379,6 +487,44 @@ func TestHostileHarness(t *testing.T) {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		return rec.Code, rec.Body.String()
+	}
+
+	sendBody := func(role, tenant, method, path, body string) (int, string) {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), principalKey, Principal{ID: "p", Role: role, TenantID: tenant}))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+
+	// Cross-tenant offensive-RoE write: a tenantB operator must not set tenantA's rules of engagement.
+	// The write is tenant-scoped (GetByIDInTenant), so it fails ErrNotFound rather than mutating.
+	if code, _ := sendBody("consultant", "tenantB", http.MethodPut, "/api/v1/engagements/engA/offensive-roe", `{"customer_contact":"x","emergency_contact":"y","risk_ceiling":"low","exclusions_checked":true}`); code != http.StatusNotFound {
+		t.Errorf("cross-tenant offensive-roe write = %d, want 404", code)
+	}
+
+	// Cross-tenant adversary emulation: a tenantB operator must not run emulation against tenantA's
+	// engagement. withEngTenant rejects the engagement before the run is built.
+	if code, _ := sendBody("consultant", "tenantB", http.MethodPost, "/api/v1/engagements/engA/emulation", `{"target":"asset-1"}`); code != http.StatusNotFound {
+		t.Errorf("cross-tenant emulation run = %d, want 404", code)
+	}
+
+	// Cross-tenant exploitation rehearsal: a tenantB operator must not rehearse a chain against tenantA's
+	// engagement. withEngTenant rejects the engagement before the chain is built.
+	if code, _ := sendBody("consultant", "tenantB", http.MethodPost, "/api/v1/engagements/engA/exploitation/rehearsals", `{"steps":[{"technique":"recon.service_banner","target":"asset-1","blast_radius":"read_only"}]}`); code != http.StatusNotFound {
+		t.Errorf("cross-tenant exploitation rehearsal = %d, want 404", code)
+	}
+
+	// Cross-tenant user provisioning: a tenantA admin must not be able to mint an operator (and
+	// receive that operator's API key) inside tenantB.
+	if code, body := sendBody("admin", "tenantA", http.MethodPost, "/api/v1/users", `{"name":"Planted","role":"admin","tenant_id":"other-b"}`); code != http.StatusForbidden || strings.Contains(body, "syn_") {
+		t.Errorf("tenantA admin provisioned into another tenant: code=%d body=%s", code, body)
+	}
+	// Roster reads are tenant-scoped: a tenantB admin sees tenantB operators only.
+	if code, body := send("admin", "tenantB", http.MethodGet, "/api/v1/users", true); code != http.StatusOK ||
+		strings.Contains(body, tenantAAdmin.ID.String()) || strings.Contains(body, "A Admin") ||
+		!strings.Contains(body, "B Admin") || !strings.Contains(body, "B Member") {
+		t.Errorf("tenantB admin observed the wrong roster: code=%d body=%s", code, body)
 	}
 
 	verifyPromotion := func(role, tenant string) (int, string) {
@@ -460,6 +606,10 @@ func TestHostileHarness(t *testing.T) {
 		// The scan-job read carries its engagement in the RESPONSE, not the path, so withEngTenant
 		// cannot wrap it; the handler re-checks the tenant itself. A machine role is denied outright.
 		{"machine may not read scan job (view)", "agent", "tenantA", true, http.MethodGet, "/api/v1/sca/scans/job-1", http.StatusForbidden},
+		// #823 durable DAST run status route: view-gated and tenant-scoped through withEngTenant.
+		{"readonly may read own-tenant dast run", "readonly", "tenantA", true, http.MethodGet, "/api/v1/engagements/engA/dast/runs/dast-run-a", http.StatusOK},
+		{"machine may not read dast run (view)", "agent", "tenantA", true, http.MethodGet, "/api/v1/engagements/engA/dast/runs/dast-run-a", http.StatusForbidden},
+		{"tenantB cannot read tenantA dast run", "admin", "tenantB", true, http.MethodGet, "/api/v1/engagements/engA/dast/runs/dast-run-a", http.StatusNotFound},
 		{"readonly may not read audit (review)", "readonly", "tenantA", true, http.MethodGet, "/api/v1/audit", http.StatusForbidden},
 		{"readonly may not manage users (administer)", "readonly", "tenantA", true, http.MethodGet, "/api/v1/users", http.StatusForbidden},
 		// Consultant: operate yes (covered elsewhere), but NOT review or administer.
@@ -573,6 +723,14 @@ func TestHostileHarness(t *testing.T) {
 		{"readonly may export fleet coverage (view)", "readonly", "tenantA", true, http.MethodGet, "/api/v1/fleet/coverage/export", http.StatusOK},
 		{"same-tenant fleet agent detail → 200", "readonly", "tenantA", true, http.MethodGet, "/api/v1/fleet/agents/ag1", http.StatusOK},
 		{"cross-tenant fleet agent detail → 404", "readonly", "tenantB", true, http.MethodGet, "/api/v1/fleet/agents/ag1", http.StatusNotFound},
+		// #820 host vulnerabilities (PermView): machine roles denied, readonly may read, a cross-tenant
+		// host read is 404, a principal-less read is denied. The cross-tenant LIST emptiness is asserted
+		// on the body below the table.
+		{"readonly may list hosts (view)", "readonly", "tenantA", true, http.MethodGet, "/api/v1/assets/hosts", http.StatusOK},
+		{"machine may not list hosts (view/SoD)", "agent", "tenantA", true, http.MethodGet, "/api/v1/assets/hosts", http.StatusForbidden},
+		{"principal-less host list is denied", "", "", false, http.MethodGet, "/api/v1/assets/hosts", http.StatusForbidden},
+		{"readonly may read a host's vulnerabilities (view)", "readonly", "tenantA", true, http.MethodGet, "/api/v1/assets/host-A/vulnerabilities", http.StatusOK},
+		{"cross-tenant host vulnerabilities → 404", "consultant", "tenantB", true, http.MethodGet, "/api/v1/assets/host-A/vulnerabilities", http.StatusNotFound},
 	}
 	for _, c := range cases {
 		if got, body := send(c.role, c.tenant, c.method, c.path, c.authed); got != c.want {
@@ -603,6 +761,20 @@ func TestHostileHarness(t *testing.T) {
 	if code, body := send("readonly", "tenantB", http.MethodGet, "/api/v1/attack-paths", true); code != http.StatusOK || strings.Contains(body, "tenant-A-secret-marker") {
 		t.Errorf("tenantB attack paths leaked tenantA data (code=%d body=%s)", code, body)
 	}
+	// #820 host vulnerabilities: tenantA sees its host and the host's finding; tenantB's list is an
+	// empty 200 and the host read is a 404 that carries nothing of tenantA's.
+	if code, body := send("readonly", "tenantA", http.MethodGet, "/api/v1/assets/hosts", true); code != http.StatusOK || !strings.Contains(body, "host-A") || !strings.Contains(body, "hostctx-A") {
+		t.Fatalf("tenantA must see its own host (code=%d body=%s)", code, body)
+	}
+	if code, body := send("readonly", "tenantA", http.MethodGet, "/api/v1/assets/host-A/vulnerabilities", true); code != http.StatusOK || !strings.Contains(body, "CVE-2026-0001") {
+		t.Fatalf("tenantA must see its host's findings (code=%d body=%s)", code, body)
+	}
+	if code, body := send("readonly", "tenantB", http.MethodGet, "/api/v1/assets/hosts", true); code != http.StatusOK || strings.Contains(body, "host-A") || strings.Contains(body, "hostctx-A") {
+		t.Errorf("cross-tenant host list must be empty (code=%d body=%s)", code, body)
+	}
+	if code, body := send("consultant", "tenantB", http.MethodGet, "/api/v1/assets/host-A/vulnerabilities", true); code != http.StatusNotFound || strings.Contains(body, "CVE-2026-0001") || strings.Contains(body, "hostctx-A") {
+		t.Errorf("cross-tenant host read must be 404 with no tenantA data (code=%d body=%s)", code, body)
+	}
 
 	// Cross-tenant fleet reads must return NOTHING, not merely a 200. tenantA's asset id must never
 	// appear in tenantB's coverage or agent list (the #413 no-cross-tenant-aggregate requirement).
@@ -616,5 +788,138 @@ func TestHostileHarness(t *testing.T) {
 		} else if strings.Contains(body, "asset-A") || strings.Contains(body, "ag1") {
 			t.Errorf("cross-tenant %s leaked tenantA data: %s", path, body)
 		}
+	}
+
+	// Generated cross-tenant sweep. The hand-written cases above prove specific leaks are closed;
+	// this walks the whole tenant-scoped GET surface from the route table so a route added tomorrow
+	// is probed the day it is registered, instead of waiting for somebody to remember the harness.
+	//
+	// The property asserted is the weakest one that is still true of every route: a caller in
+	// tenantB asking for a tenantA-owned path must not be answered with that resource. A 403 or a
+	// 404 is correct, and so is a 200 that carries none of tenantA's markers. A 200 that echoes a
+	// tenantA identifier is the leak.
+	t.Run("generated cross-tenant sweep", func(t *testing.T) {
+		// Markers seeded into tenantA only. A tenantB caller must never see one of these.
+		// Values the fixture seeds for tenantA only. "tenantA" itself is the broadest: a response
+		// to a tenantB caller that names tenantA is a leak whatever else it contains.
+		markers := []string{"tenantA", "promotion-finding-A", "asset-A", "ag1", "A Admin", "det-A", "ev-A", "agent:A", "host-A"}
+		containsMarker := func(body string) string {
+			for _, marker := range markers {
+				if strings.Contains(body, marker) {
+					return marker
+				}
+			}
+			return ""
+		}
+		// probe runs one request and reports whether the handler could run at all. This fixture
+		// deliberately leaves optional subsystems unwired, and their handlers dereference the
+		// dependency the router guarantees them in production, so an unwired route panics here.
+		// That is a gap in the fixture rather than a tenancy finding, so it is counted and skipped.
+		probe := func(tenant, path string) (code int, body string, ran bool) {
+			defer func() {
+				if recover() != nil {
+					ran = false
+				}
+			}()
+			code, body = send("admin", tenant, http.MethodGet, path, true)
+			return code, body, true
+		}
+
+		var probed, unwired, servingTenantA int
+		var servingRoutes []string
+		for _, route := range tenantScopedGETRoutes(t) {
+			path := concreteHarnessPath(route)
+			if path == "" {
+				continue
+			}
+			// Control: does this route serve tenantA its own seeded data? A route that answers
+			// nobody proves nothing when it also answers tenantB nothing, so the count below keeps
+			// the sweep from decaying into a set of vacuous passes.
+			code, body, ran := probe("tenantA", path)
+			if !ran {
+				unwired++
+				continue
+			}
+			probed++
+			if code == http.StatusOK && containsMarker(body) != "" {
+				servingTenantA++
+				servingRoutes = append(servingRoutes, route)
+			}
+			t.Run(route, func(t *testing.T) {
+				code, body, ran := probe("tenantB", path)
+				if !ran {
+					t.Skip("subsystem is not wired in this fixture")
+				}
+				if code == http.StatusOK {
+					if marker := containsMarker(body); marker != "" {
+						t.Errorf("%s answered a tenantB caller with tenantA data (marker %q): %s", route, marker, body)
+					}
+				}
+				if code >= 500 {
+					t.Errorf("%s returned %d for a cross-tenant read; a guard must reject, not crash: %s", route, code, body)
+				}
+			})
+		}
+		if probed < 40 {
+			t.Errorf("the sweep probed %d routes; the route table is no longer being read", probed)
+		}
+		// Five routes in this fixture are seeded with tenantA data, so for those the tenantB probe
+		// proves a real absence. For the rest the sweep proves the weaker but still useful property
+		// that a cross-tenant read neither crashes nor echoes a tenantA identifier. Raise this floor
+		// when you seed more fixture data; never lower it.
+		if servingTenantA < 5 {
+			t.Errorf("only %d of %d probed routes served tenantA its own seeded data (%v); the sweep is passing vacuously", servingTenantA, probed, servingRoutes)
+		}
+		t.Logf("generated sweep probed %d tenant-scoped GET routes (%d serve tenantA real data); %d skipped as unwired in this fixture", probed, servingTenantA, unwired)
+	})
+}
+
+// tenantScopedGETRoutes reads the route table and returns every GET route whose path carries an
+// engagement, project or asset id. Those are the routes that serve one tenant's resource by id, so
+// a caller from another tenant must not be answered with it.
+func tenantScopedGETRoutes(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, route := range registeredRoutes(t) {
+		pattern := route.Pattern
+		if !strings.HasPrefix(pattern, "GET ") {
+			continue
+		}
+		if strings.Contains(pattern, "/engagements/{") || strings.Contains(pattern, "/projects/{") || strings.Contains(pattern, "/assets/{") {
+			out = append(out, pattern)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// harnessPathValues maps a route parameter to the concrete id the harness fixture seeds for it.
+// A parameter with no entry means the route cannot be probed generically, and it is skipped rather
+// than probed with a guessed value that would only ever produce a 404.
+var harnessPathValues = map[string]string{
+	"{id}": "engA", "{key}": "project-a", "{assetID}": "asset-A", "{aid}": "asset-A",
+	"{fid}": "f1", "{jid}": "j1", "{rid}": "r1", "{sid}": "s1", "{cid}": "c1",
+	"{a}": "a1", "{pid}": "p1", "{tid}": "t1", "{vid}": "v1", "{eid}": "e1", "{name}": "n1",
+}
+
+// concreteHarnessPath turns a registered pattern into a request path the harness fixture can serve,
+// or "" when a parameter has no seeded value.
+func concreteHarnessPath(route string) string {
+	path := route[strings.Index(route, " ")+1:]
+	for {
+		open := strings.Index(path, "{")
+		if open < 0 {
+			return path
+		}
+		closeAt := strings.Index(path[open:], "}")
+		if closeAt < 0 {
+			return ""
+		}
+		param := path[open : open+closeAt+1]
+		value, ok := harnessPathValues[param]
+		if !ok {
+			return ""
+		}
+		path = path[:open] + value + path[open+closeAt+1:]
 	}
 }

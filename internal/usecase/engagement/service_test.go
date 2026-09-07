@@ -60,6 +60,14 @@ func (r *memRepo) GetByProjectID(_ context.Context, tenantID, projectID shared.I
 	}
 	return nil, shared.ErrNotFound
 }
+func (r *memRepo) GetByHostAssetID(_ context.Context, tenantID, assetID shared.ID) (*domain.Engagement, error) {
+	for _, e := range r.data {
+		if !assetID.IsZero() && e.HostAssetID == assetID && (tenantID.IsZero() || e.TenantID == tenantID) {
+			return e, nil
+		}
+	}
+	return nil, shared.ErrNotFound
+}
 func (r *memRepo) ProjectContexts(_ context.Context, tenantID shared.ID, projectIDs []shared.ID) (map[shared.ID]*domain.Engagement, error) {
 	out := map[shared.ID]*domain.Engagement{}
 	for _, id := range projectIDs {
@@ -373,5 +381,33 @@ func TestEngagementTenantIsolation(t *testing.T) {
 	}
 	if _, err := svc.SetLiveRecon(ctx, "mallory", shared.ID("tenant-B"), engA.ID, true, "1.0", "I attest"); !errors.Is(err, shared.ErrNotFound) {
 		t.Errorf("cross-tenant SetLiveRecon must be ErrNotFound, got %v", err)
+	}
+}
+
+func TestSetOffensiveRoE(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	repo := newMemRepo()
+	audit := &capAudit{}
+	svc := NewService(repo, fixedClock{now}, fixedIDs{}, audit)
+	e, err := svc.Create(ctx, CreateInput{Name: "Acme", Client: "Acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An unknown risk ceiling is refused.
+	if _, err := svc.SetOffensiveRoE(ctx, "op", "", e.ID, "Ops", "+1", "bogus", true); !errors.Is(err, shared.ErrValidation) {
+		t.Errorf("unknown risk ceiling must be refused, got %v", err)
+	}
+	// A complete RoE is persisted.
+	got, err := svc.SetOffensiveRoE(ctx, "op", "", e.ID, "Ops", "+1", "high", true)
+	if err != nil {
+		t.Fatalf("SetOffensiveRoE: %v", err)
+	}
+	if got.CustomerContact != "Ops" || got.RiskCeiling != "high" || !got.ExclusionsChecked || got.Audit.UpdatedBy != "op" {
+		t.Fatalf("RoE not persisted: %+v", got)
+	}
+	// A cross-tenant write cannot see the engagement.
+	if _, err := svc.SetOffensiveRoE(ctx, "mallory", shared.ID("tenant-B"), e.ID, "X", "Y", "low", true); !errors.Is(err, shared.ErrNotFound) {
+		t.Errorf("cross-tenant SetOffensiveRoE must be ErrNotFound, got %v", err)
 	}
 }

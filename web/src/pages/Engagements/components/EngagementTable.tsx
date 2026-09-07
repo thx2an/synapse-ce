@@ -10,9 +10,11 @@ import {
   Check,
   Target01,
 } from '@untitledui/icons'
+import { Tooltip, TooltipTrigger } from '../../../components/base/tooltip/tooltip'
 import { StatusPill } from './StatusPill'
 import { EngagementRowActions } from './EngagementRowActions'
-import { SeverityBadge } from '../../../components/synapse/SeverityBadge'
+import { SeverityBuckets } from '../../../components/synapse/SeverityCount'
+import { ScanStatusPill, scanStateOf } from '../../../components/synapse/ScanStatusPill'
 import type { Engagement } from '../../../lib/types'
 import type { SortField, SortDirection } from '../types'
 
@@ -94,7 +96,7 @@ export const EngagementTable: FC<EngagementTableProps> = ({
     <div className="flex flex-col overflow-hidden rounded-xl border border-secondary bg-primary shadow-xs">
       {/* Table Container */}
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[760px] border-collapse text-left text-sm" role="table" aria-rowcount={totalItems + 1}>
+        <table className="w-full min-w-[960px] table-fixed border-collapse text-left text-sm" role="table" aria-rowcount={totalItems + 1}>
           <thead>
             <tr className="border-b border-secondary bg-secondary text-xs font-semibold text-tertiary">
               {/* Column 1: Name */}
@@ -110,7 +112,7 @@ export const EngagementTable: FC<EngagementTableProps> = ({
               </th>
 
               {/* Column 2: In Scope */}
-              <th scope="col" className="w-[200px] px-4 py-3">
+              <th scope="col" className="w-[260px] px-4 py-3">
                 <button
                   type="button"
                   onClick={() => onSort('repository')}
@@ -122,7 +124,7 @@ export const EngagementTable: FC<EngagementTableProps> = ({
               </th>
 
               {/* Column 3: Status */}
-              <th scope="col" className="w-[120px] px-4 py-3">
+              <th scope="col" className="w-[110px] px-4 py-3">
                 <button
                   type="button"
                   onClick={() => onSort('status')}
@@ -134,7 +136,7 @@ export const EngagementTable: FC<EngagementTableProps> = ({
               </th>
 
               {/* Column 4: Findings */}
-              <th scope="col" className="w-[180px] px-4 py-3">
+              <th scope="col" className="w-[250px] px-4 py-3">
                 <button
                   type="button"
                   onClick={() => onSort('findings')}
@@ -278,49 +280,51 @@ export const EngagementTable: FC<EngagementTableProps> = ({
 
                     {/* Column 4: Findings breakdown */}
                     <td className="px-4 py-3.5">
-                      {totalFindings > 0 ? (
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="font-mono text-xs font-semibold tabular-nums text-primary">
-                            {totalFindings}
-                          </span>
-                          {(findingsCount?.critical ?? 0) > 0 && (
-                            <SeverityBadge
-                              severity="critical"
-                              size="sm"
-                              showIcon={false}
-                              className="font-mono text-[10px] tabular-nums"
-                            />
-                          )}
-                          {(findingsCount?.high ?? 0) > 0 && (
-                            <SeverityBadge
-                              severity="high"
-                              size="sm"
-                              showIcon={false}
-                              className="font-mono text-[10px] tabular-nums"
-                            />
-                          )}
-                          {(findingsCount?.medium ?? 0) > 0 && (
-                            <SeverityBadge
-                              severity="medium"
-                              size="sm"
-                              showIcon={false}
-                              className="font-mono text-[10px] tabular-nums"
-                            />
-                          )}
-                        </div>
-                      ) : (
+                      {findingsCount === null ? (
+                        // The list endpoint does not carry counts. Rendering 0
+                        // here read as "no findings" on engagements with
+                        // hundreds, so say "unknown" instead of guessing.
+                        <Tooltip
+                          title="Not reported"
+                          description="not reported by the list endpoint"
+                          placement="top"
+                          arrow
+                        >
+                          <TooltipTrigger aria-label="Findings count not reported by the list endpoint">
+                            <span className="font-mono text-xs text-tertiary cursor-help">&mdash;</span>
+                          </TooltipTrigger>
+                        </Tooltip>
+                      ) : totalFindings > 0 ? (
+                        <SeverityBuckets
+                          total={totalFindings}
+                          counts={{ critical: findingsCount?.critical ?? 0, high: findingsCount?.high ?? 0, medium: findingsCount?.medium ?? 0, low: findingsCount?.low ?? 0 }}
+                        />
+                      ) : engagement.lastScanStatus === 'running' ? (
+                        <span className="font-mono text-xs text-quaternary" title="No findings from previous runs; the current scan has not finished">&mdash;</span>
+                      ) : engagement.lastScanDate ? (
                         <span className="font-mono text-xs text-tertiary">0</span>
+                      ) : (
+                        <span className="font-mono text-xs text-quaternary">Not scanned</span>
                       )}
                     </td>
 
-                    {/* Column 5: Last Scan */}
+                    {/* Column 5: Last Scan carries the scan's state and time, never the creation time. */}
                     <td className="px-4 py-3.5">
-                      <span
-                        className="font-mono text-xs text-secondary"
-                        title={engagement.lastScanDate || engagement.createdAt || undefined}
-                      >
-                        {formatRelativeTime(engagement.lastScanDate || engagement.createdAt)}
-                      </span>
+                      {engagement.lastScanDate ? (
+                        <div className="flex flex-wrap items-center gap-1.5" title={engagement.lastScanDate}>
+                          <ScanStatusPill state={scanStateOf(engagement.lastScanStatus ?? 'succeeded')} />
+                          <span className="font-mono text-xs text-tertiary">
+                            {engagement.lastScanStatus === 'running' ? `started ${formatRelativeTime(engagement.lastScanDate)}` : formatRelativeTime(engagement.lastScanDate)}
+                          </span>
+                        </div>
+                      ) : (
+                        <span
+                          className="font-mono text-xs text-quaternary"
+                          title={engagement.createdAt ? `Created ${formatRelativeTime(engagement.createdAt)}, no scan has run` : 'No scan has run'}
+                        >
+                          Not scanned
+                        </span>
+                      )}
                     </td>
 
                     {/* Column 6: Actions menu */}

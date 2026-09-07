@@ -46,6 +46,9 @@ type rule struct {
 	group    int
 	minEnt   float64
 	allow    []*regexp.Regexp // per-rule allow-list (matched against the secret text)
+	// lineSkip, when set, drops a match based on the whole line it sits on. It is how a rule tells a
+	// delimiter quoted inside other code from the thing it delimits.
+	lineSkip func(line string) bool
 }
 
 // Scanner implements ports.SecretScanner with an owned ruleset.
@@ -229,6 +232,9 @@ func (s *Scanner) scanContent(rel string, data []byte, seen map[string]bool, out
 			if s.allowed(secret, r.allow) {
 				continue
 			}
+			if r.lineSkip != nil && r.lineSkip(lineOf(text, start)) {
+				continue
+			}
 			if r.minEnt > 0 && shannon(secret) < r.minEnt {
 				continue
 			}
@@ -250,6 +256,27 @@ func (s *Scanner) scanContent(rel string, data []byte, seen map[string]bool, out
 		}
 	}
 	return false
+}
+
+// lineOf returns the full line containing byte offset at.
+func lineOf(text string, at int) string {
+	start := strings.LastIndexByte(text[:at], '\n') + 1
+	end := strings.IndexByte(text[at:], '\n')
+	if end < 0 {
+		return text[start:]
+	}
+	return text[start : at+end]
+}
+
+// pemHeaderQuotedInline reports whether the PEM header on this line is a quoted one-line constant rather
+// than the first line of a key block: the header is not at the start of the line, or the same line also
+// carries the END marker or an escaped newline.
+func pemHeaderQuotedInline(line string) bool {
+	trimmed := strings.TrimLeft(line, " \t\"'`")
+	if !strings.HasPrefix(trimmed, "-----BEGIN") {
+		return true
+	}
+	return strings.Contains(line, "-----END") || strings.Contains(line, `\n`)
 }
 
 // maskVBComments preserves byte offsets and newlines while blanking apostrophe and statement Rem comments.
@@ -425,6 +452,10 @@ func defaultRules() []rule {
 			id: "private-key", category: "PrivateKey", title: "Private key block", severity: shared.SeverityCritical,
 			keywords: []string{"PRIVATE KEY"},
 			re:       regexp.MustCompile(`-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----`),
+			// A key block starts its line with the header (a PEM file, a raw string). A header that sits
+			// after other code on its line, with the END marker or an escaped newline beside it, is a
+			// one-line string constant: a rule example, a delimiter to strip, a test name.
+			lineSkip: pemHeaderQuotedInline,
 		},
 		{
 			id: "jwt", category: "JWT", title: "JSON Web Token", severity: shared.SeverityMedium,
@@ -621,10 +652,15 @@ func defaultRules() []rule {
 		{
 			id: "generic-secret", category: "Generic", title: "Hardcoded secret", severity: shared.SeverityMedium,
 			keywords: []string{"secret", "token", "passwd", "password", "api_key", "apikey", "apiKey", "access_key", "SECRET", "TOKEN", "API_KEY"},
-			re:       regexp.MustCompile(`(?i)(?:(?:(?:public|private|protected|friend|shared|static|readonly|writable|shadows|overrides|overridable|notinheritable|mustinherit)\s+)*(?:dim|const)\s+)?(?:\[(?:api[_-]?key|secret|token|passwd|password|access[_-]?key)\]|(?:api[_-]?key|secret|token|passwd|password|access[_-]?key))\$?\s*(?:as\s+[A-Za-z_][A-Za-z0-9_.]*)?\s*["']?\s*[:=]\s*["']([A-Za-z0-9/+=_\-]{16,})["']`),
-			group:    1,
-			minEnt:   3.5,
-			allow:    compileAll([]string{`(?i)^(true|false|null|none|localhost)$`}),
+			// The key had to be the bare word or a VB [bracketed] keyword, which missed the two
+			// shapes real config files use: camelCase (`cookieSecret: "\u2026"`) and a bracketed
+			// config key (`app.config['SECRET_KEY_HMAC_2'] = "\u2026"`). The keyword may now carry
+			// an identifier suffix and be wrapped in brackets and quotes. The value guards
+			// (16 characters, entropy 3.5, allow-list) are untouched, so precision is unchanged.
+			re:     regexp.MustCompile(`(?i)(?:(?:(?:public|private|protected|friend|shared|static|readonly|writable|shadows|overrides|overridable|notinheritable|mustinherit)\s+)*(?:dim|const)\s+)?(?:\[\s*["']?)?(?:api[_-]?key|secret|token|passwd|password|access[_-]?key)[A-Za-z0-9_]{0,32}["']?\s*\]?\$?\s*(?:as\s+[A-Za-z_][A-Za-z0-9_.]*)?\s*["']?\s*\]?\s*[:=]\s*["']([A-Za-z0-9/+=_\-]{16,})["']`),
+			group:  1,
+			minEnt: 3.5,
+			allow:  compileAll([]string{`(?i)^(true|false|null|none|localhost)$`}),
 		},
 	}
 }

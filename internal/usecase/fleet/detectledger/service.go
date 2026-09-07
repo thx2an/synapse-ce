@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/KKloudTarus/synapse-ce/internal/domain/detection"
@@ -74,7 +75,15 @@ type IngestResult struct {
 	EvidenceIDs   []shared.ID
 	Skipped       []shared.ID // already-sealed detections skipped on an idempotent retry
 	Gap           fleetagent.SequenceGap
+	// CorrelationScheduled reports that the sealed detections were handed to the correlator, which runs
+	// them off the request path; its outcome is audited (fleet.correlate_engagement or
+	// detection.correlate_on_ingest_failed), never awaited by the agent.
+	CorrelationScheduled bool
 }
+
+// CorrelateFunc folds an engagement's sealed detections into incidents and returns how many it created.
+// correlationuc.Service.CorrelateEngagement is adapted to it in the composition root.
+type CorrelateFunc func(ctx context.Context, actor string, engagementID shared.ID) (created int, err error)
 
 // Service ingests agent detection batches into the evidence ledger.
 type Service struct {
@@ -88,7 +97,74 @@ type Service struct {
 	ids        ports.IDGenerator
 	retention  time.Duration    // 0 = keep the projection forever (the chain is always permanent)
 	holds      legalHoldChecker // optional (#635): when set, an active hold blocks retention expiry
+	correlate  CorrelateFunc    // optional: when set, a batch that seals new detections is correlated at once
+	runs       *correlationRuns // per-engagement coalescing for the asynchronous correlator
 }
+
+// SetCorrelator wires correlation-on-ingest. With it, an incident exists as soon as the detections behind
+// it are sealed, without an operator calling the correlate route. Correlation runs asynchronously, one
+// run per engagement at a time: a batch arriving while a run is in flight schedules exactly one rerun
+// after it, so a flood of batches costs one full pass, not one per batch, and never holds the agent's
+// request. A correlator failure is audited; the sealed detections are never rolled back.
+func (s *Service) SetCorrelator(f CorrelateFunc) {
+	s.correlate = f
+	s.runs = newCorrelationRuns()
+}
+
+// WaitCorrelation blocks until every scheduled correlation run has finished. Tests use it.
+func (s *Service) WaitCorrelation() {
+	if s.runs != nil {
+		s.runs.wait()
+	}
+}
+
+// correlationRuns coalesces correlation per engagement: at most one run in flight and at most one
+// pending rerun.
+type correlationRuns struct {
+	mu      sync.Mutex
+	active  map[shared.ID]*correlationRun
+	inflght sync.WaitGroup
+}
+
+type correlationRun struct {
+	pending bool
+	actor   string
+	ctx     context.Context
+}
+
+func newCorrelationRuns() *correlationRuns {
+	return &correlationRuns{active: map[shared.ID]*correlationRun{}}
+}
+
+// schedule starts a run for the engagement, or marks a rerun if one is in flight. run is invoked on a
+// goroutine with the detached context of the most recent request.
+func (r *correlationRuns) schedule(ctx context.Context, actor string, engagementID shared.ID, run func(context.Context, string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.active[engagementID]; ok {
+		cur.pending, cur.actor, cur.ctx = true, actor, ctx
+		return
+	}
+	cur := &correlationRun{actor: actor, ctx: ctx}
+	r.active[engagementID] = cur
+	r.inflght.Add(1)
+	go func() {
+		defer r.inflght.Done()
+		for {
+			run(cur.ctx, cur.actor)
+			r.mu.Lock()
+			if !cur.pending {
+				delete(r.active, engagementID)
+				r.mu.Unlock()
+				return
+			}
+			cur.pending = false
+			r.mu.Unlock()
+		}
+	}()
+}
+
+func (r *correlationRuns) wait() { r.inflght.Wait() }
 
 // legalHoldChecker reports whether an engagement is under an active legal hold. legalholduc.Service
 // satisfies it. When wired, Expire refuses to delete a held engagement's data (fail-closed preservation).
@@ -273,7 +349,27 @@ func (s *Service) Ingest(ctx context.Context, authAgentID shared.ID, batch fleet
 		}); err != nil {
 		return result, fmt.Errorf("audit sealed detection batch: %w", err)
 	}
+	s.correlateAfterIngest(ctx, batch.AgentID.String(), batch.EngagementID, &result)
 	return result, nil
+}
+
+// correlateAfterIngest schedules the wired correlator when the batch sealed at least one new detection.
+// The run happens off the request path with a context detached from the request's cancellation; the
+// detections are durable, so a correlator failure is audited (never returned) and the operator route
+// can still correlate later.
+func (s *Service) correlateAfterIngest(ctx context.Context, actor string, engagementID shared.ID, result *IngestResult) {
+	if s.correlate == nil || s.runs == nil || len(result.SealedRecords) == 0 {
+		return
+	}
+	result.CorrelationScheduled = true
+	sealed := len(result.SealedRecords)
+	s.runs.schedule(context.WithoutCancel(ctx), actor, engagementID, func(runCtx context.Context, runActor string) {
+		if _, err := s.correlate(runCtx, runActor, engagementID); err != nil {
+			_ = s.recordAudit(runCtx, "detection.correlate_on_ingest_failed", runActor, map[string]string{
+				"engagement": engagementID.String(), "sealed": fmt.Sprint(sealed), "error": err.Error(),
+			})
+		}
+	})
 }
 
 // IngestV2 admits a separately signed v2 detection batch. A v2 item cannot be admitted without its
@@ -380,6 +476,7 @@ func (s *Service) IngestV2(ctx context.Context, authAgentID shared.ID, batch fle
 		}); err != nil {
 		return result, fmt.Errorf("audit reconciled v2 detection batch: %w", err)
 	}
+	s.correlateAfterIngest(ctx, batch.AgentID.String(), batch.EngagementID, &result)
 	return result, nil
 }
 
@@ -568,6 +665,7 @@ func (s *Service) ReconcilePendingDetections(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("list pending detection provenance: %w", err)
 	}
 	completed := 0
+	touched := map[shared.ID]shared.ID{} // engagement -> tenant, for the engagements that gained a complete detection
 	for _, state := range current {
 		wasCompleted, _, err := s.reconcileDetection(ctx, state)
 		if err != nil {
@@ -575,7 +673,14 @@ func (s *Service) ReconcilePendingDetections(ctx context.Context) (int, error) {
 		}
 		if wasCompleted {
 			completed++
+			touched[state.EngagementID] = state.TenantID
 		}
+	}
+	// A detection completed here is as durable as one sealed at ingest, so it gets the same correlation
+	// pass; without it an incident would wait for the next batch that happens to seal something.
+	for engagementID, tenantID := range touched {
+		result := IngestResult{EngagementID: engagementID, SealedRecords: []shared.ID{engagementID}}
+		s.correlateAfterIngest(shared.WithTenant(ctx, tenantID), "system:detection-reconcile", engagementID, &result)
 	}
 	return completed, nil
 }

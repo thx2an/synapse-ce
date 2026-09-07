@@ -9,8 +9,10 @@ import (
 
 	"github.com/KKloudTarus/synapse-ce/internal/domain/agent"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/aitriagereview"
+	"github.com/KKloudTarus/synapse-ce/internal/domain/dastrun"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/finding"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/judgment"
+	"github.com/KKloudTarus/synapse-ce/internal/domain/offensivepolicy"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/qualitygate"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/shared"
 	userdom "github.com/KKloudTarus/synapse-ce/internal/domain/user"
@@ -67,47 +69,60 @@ type Router struct {
 	integrations           *integrationuc.Service
 	dastVerifier           runtimeVerifierService
 	dastWorkflow           dastWorkflowService
-	agent                  *agentDeps                // optional; nil ⇒ agent routes are not registered
-	exploitation           findingVerifier           // optional; nil ⇒ the verify route is not registered
-	judgments              judgmentService           // optional; nil ⇒ judgment routes are not registered
-	autoVerifier           autoVerifierService       // optional; nil ⇒ the LLM auto-verify route is not registered
-	threatModels           threatModelService        // optional; nil ⇒ threat-model routes are not registered
-	drafts                 writeupDraftService       // optional; nil ⇒ writeup-draft sign-off routes are not registered
-	aiTriageReviews        aiTriageReviewService     // optional; nil ⇒ AI-triage review queue routes are not registered
-	projects               projectService            // optional; nil ⇒ project routes are not registered
-	assets                 assetService              // optional; nil ⇒ fleet asset routes are not registered
-	cspm                   *cspm.Service             // optional; nil ⇒ CSPM routes are not registered
-	businessAssets         businessAssetService      // optional; nil ⇒ business-level Asset routes are not registered
-	attackPaths            attackPathService         // optional; nil ⇒ attack-path routes are not registered
-	coverage               coverageService           // optional; nil ⇒ fleet coverage/agent-view routes are not registered
-	coverageWindows        coverageWindowReader      // optional; nil ⇒ immutable telemetry coverage-window routes are not registered
-	privacyPolicies        privacyPolicyService      // optional; nil ⇒ tenant source-privacy policy routes are not registered
-	incidents              incidentReader            // optional; nil ⇒ incident read routes are not registered (#594 C7)
-	incidentTriage         incidentTriager           // optional; nil ⇒ incident triage routes are not registered (#594 C5)
-	incidentRiskReassessor incidentRiskReassessor    // optional; nil ⇒ the tri-score reassess route is not registered (#594 C3/D/X5)
-	incidentCorrelator     incidentCorrelator        // optional; nil ⇒ the correlation route is not registered (#594 C2/C3)
-	endpointProcesses      endpointProcessStore      // optional; nil ⇒ the process-report routes are not registered (#594 B5)
-	processLearner         processLearner            // optional; nil ⇒ reported processes are not folded into the behavior baseline (#594 D)
-	desiredCapabilities    desiredCapabilityService  // optional; nil ⇒ the desired-vs-observed routes are not registered (#633)
-	legalHolds             legalHoldService          // optional; nil ⇒ the legal-hold routes are not registered (#635)
-	privacyExport          privacyExporter           // optional; nil ⇒ the data-export route is not registered (#635)
-	dataPurge              dataPurger                // optional; nil ⇒ the on-demand data-deletion route is not registered (#635)
-	endpointTimeline       endpointTimelineReader    // optional; nil ⇒ the State-Timeline read route is not registered (#594 B7)
-	retroHunter            retroHunter               // optional; nil ⇒ the retro-hunt route is not registered (#594 B7)
-	sarif                  sarifIngester             // optional; nil ⇒ the third-party SARIF import route is not registered
-	importedFindings       sarifReader               // optional read side for imported findings
-	fleetRolloutAdmin      fleetRolloutService       // optional; nil ⇒ the operator rollout routes are not served
-	offensiveHalt          offensiveKillSwitch       // optional; nil ⇒ the red-team halt route is not served
-	detections             detectionReader           // optional read side for the detection ledger (#423)
-	detectionProvenance    detectionProvenanceReader // optional read side for durable detection provenance (#610)
-	riskStories            riskStoryReader           // optional read side for the unified per-asset risk story (#427)
-	purpleCoverage         purpleCoverageReader      // optional read side for purple-team coverage (#426)
-	fleet                  *fleetRouter              // optional; nil ⇒ agent transport plane is not served
-	fleetAdmin             fleetAdminService         // optional; nil ⇒ operator agent-admin routes not registered
-	fleetKeys              fleetKeyAdmin             // optional; nil ⇒ operator signing-key routes not registered (A4 #625)
-	qualityGates           qualityGateService        // optional; nil ⇒ quality-gate routes are not registered
-	qualityProfiles        qualityProfileService     // optional; nil ⇒ quality-profile routes are not registered
-	rules                  rulesService              // optional; nil ⇒ rule catalog routes are not registered
+	dastRun                dastRunService             // optional; nil ⇒ DAST verification runs execute synchronously in-process
+	agent                  *agentDeps                 // optional; nil ⇒ agent routes are not registered
+	exploitation           findingVerifier            // optional; nil ⇒ the verify route is not registered
+	judgments              judgmentService            // optional; nil ⇒ judgment routes are not registered
+	autoVerifier           autoVerifierService        // optional; nil ⇒ the LLM auto-verify route is not registered
+	threatModels           threatModelService         // optional; nil ⇒ threat-model routes are not registered
+	drafts                 writeupDraftService        // optional; nil ⇒ writeup-draft sign-off routes are not registered
+	aiTriageReviews        aiTriageReviewService      // optional; nil ⇒ AI-triage review queue routes are not registered
+	projects               projectService             // optional; nil ⇒ project routes are not registered
+	assets                 assetService               // optional; nil ⇒ fleet asset routes are not registered
+	hostVulns              hostVulnerabilityService   // optional; nil ⇒ host vulnerability routes are not registered (#820)
+	findingSummaries       ports.FindingSummaryReader // optional; nil ⇒ engagement list rows carry no finding counts
+	scanJobs               ports.ScanJobStore         // optional; nil ⇒ engagement list rows carry no last scan
+	alerts                 alertService               // optional; nil ⇒ operator alerting routes are not registered
+	offensivePolicy        *offensivepolicy.Register  // optional; nil ⇒ the policy register route is not registered
+	responses              responseService            // optional; nil ⇒ governed defensive-response routes are not registered (#425)
+	responseIDs            ports.IDGenerator          // set with responses; mints the server-authoritative action id
+	connectors             connectorService           // optional; nil ⇒ source-control connector routes are not registered
+	cspm                   *cspm.Service              // optional; nil ⇒ CSPM routes are not registered
+	businessAssets         businessAssetService       // optional; nil ⇒ business-level Asset routes are not registered
+	attackPaths            attackPathService          // optional; nil ⇒ attack-path routes are not registered
+	coverage               coverageService            // optional; nil ⇒ fleet coverage/agent-view routes are not registered
+	coverageWindows        coverageWindowReader       // optional; nil ⇒ immutable telemetry coverage-window routes are not registered
+	privacyPolicies        privacyPolicyService       // optional; nil ⇒ tenant source-privacy policy routes are not registered
+	incidents              incidentReader             // optional; nil ⇒ incident read routes are not registered (#594 C7)
+	incidentTriage         incidentTriager            // optional; nil ⇒ incident triage routes are not registered (#594 C5)
+	incidentRiskReassessor incidentRiskReassessor     // optional; nil ⇒ the tri-score reassess route is not registered (#594 C3/D/X5)
+	incidentCorrelator     incidentCorrelator         // optional; nil ⇒ the correlation route is not registered (#594 C2/C3)
+	endpointProcesses      endpointProcessStore       // optional; nil ⇒ the process-report routes are not registered (#594 B5)
+	processLearner         processLearner             // optional; nil ⇒ reported processes are not folded into the behavior baseline (#594 D)
+	behaviorRebaseliner    behaviorRebaseliner        // optional; nil ⇒ the behavior-baseline re-baseline route is not registered (#594 D)
+	hostAssets             hostAssetVerifier          // optional; verifies an id is a live host asset before the operator process/rebaseline routes mutate state
+	desiredCapabilities    desiredCapabilityService   // optional; nil ⇒ the desired-vs-observed routes are not registered (#633)
+	legalHolds             legalHoldService           // optional; nil ⇒ the legal-hold routes are not registered (#635)
+	privacyExport          privacyExporter            // optional; nil ⇒ the data-export route is not registered (#635)
+	dataPurge              dataPurger                 // optional; nil ⇒ the on-demand data-deletion route is not registered (#635)
+	endpointTimeline       endpointTimelineReader     // optional; nil ⇒ the State-Timeline read route is not registered (#594 B7)
+	retroHunter            retroHunter                // optional; nil ⇒ the retro-hunt route is not registered (#594 B7)
+	sarif                  sarifIngester              // optional; nil ⇒ the third-party SARIF import route is not registered
+	importedFindings       sarifReader                // optional read side for imported findings
+	fleetRolloutAdmin      fleetRolloutService        // optional; nil ⇒ the operator rollout routes are not served
+	offensiveHalt          offensiveKillSwitch        // optional; nil ⇒ the red-team halt route is not served
+	detections             detectionReader            // optional read side for the detection ledger (#423)
+	detectionProvenance    detectionProvenanceReader  // optional read side for durable detection provenance (#610)
+	riskStories            riskStoryReader            // optional read side for the unified per-asset risk story (#427)
+	purpleCoverage         purpleCoverageReader       // optional read side for purple-team coverage (#426)
+	purpleTeam             purpleTeamRunner           // optional producer: runs governed emulation → coverage (#426)
+	chainRehearsal         chainRehearser             // optional: governed exploitation chain rehearsal (simulation)
+	fleet                  *fleetRouter               // optional; nil ⇒ agent transport plane is not served
+	fleetAdmin             fleetAdminService          // optional; nil ⇒ operator agent-admin routes not registered
+	fleetKeys              fleetKeyAdmin              // optional; nil ⇒ operator signing-key routes not registered (A4 #625)
+	qualityGates           qualityGateService         // optional; nil ⇒ quality-gate routes are not registered
+	qualityProfiles        qualityProfileService      // optional; nil ⇒ quality-profile routes are not registered
+	rules                  rulesService               // optional; nil ⇒ rule catalog routes are not registered
 	dastScan               dastScanService
 	vulnerabilitySources   *vulnerabilitysourceuc.Service
 	vulnerabilityMonitor   *vulnerabilitymonitor.Service
@@ -116,6 +131,7 @@ type Router struct {
 	vulnerabilityRead      *vulnerabilityinteluc.Service
 	vulnerabilityActions   *vulnerabilityactionuc.Service
 	sla                    *slauc.Service
+	capabilities           capabilityCatalog // optional; nil ⇒ the capability catalog route is not registered
 	readiness              readinessConfig
 }
 
@@ -181,6 +197,17 @@ type dastWorkflowService interface {
 
 // SetDASTWorkflow wires the governed safe-DAST proposal/approval/run endpoints.
 func (rt *Router) SetDASTWorkflow(s dastWorkflowService) { rt.dastWorkflow = s }
+
+// dastRunService is the durable-execution slice: submit a governed DAST verification as a worker job and
+// read its status. *dastrun.Service satisfies it. Left unset, a verification run executes synchronously.
+type dastRunService interface {
+	Submit(ctx context.Context, engagementID, actionID shared.ID, actor string, probe dastrunner.Probe) (dastrun.Run, error)
+	GetRun(ctx context.Context, tenantID, runID shared.ID) (dastrun.Run, error)
+}
+
+// SetDASTRunner wires durable DAST verification execution: the run route enqueues a job and a status
+// route reads it. nil ⇒ the run route executes the probe synchronously (dev / in-memory).
+func (rt *Router) SetDASTRunner(s dastRunService) { rt.dastRun = s }
 
 type dastScanService interface {
 	ProposeScan(context.Context, string, shared.ID, dastworkflowuc.ScanConfig) (dastworkflowuc.Proposal, error)
@@ -381,6 +408,15 @@ func (rt *Router) routes() *http.ServeMux {
 		mux.HandleFunc("GET /api/v1/assets", rt.authz(userdom.PermView, rt.listAssets))
 		mux.HandleFunc("POST /api/v1/assets/edges", rt.authz(userdom.PermOperate, rt.createAssetEdge))
 		mux.HandleFunc("GET /api/v1/assets/edges", rt.authz(userdom.PermView, rt.listAssetEdges))
+		mux.HandleFunc("GET /api/v1/fleet/workloads", rt.authz(userdom.PermView, rt.listFleetWorkloads))
+	}
+	if rt.hostVulns != nil {
+		mux.HandleFunc("GET /api/v1/assets/hosts", rt.authz(userdom.PermView, rt.listHostVulnerabilities))
+		mux.HandleFunc("GET /api/v1/assets/{assetID}/vulnerabilities", rt.authz(userdom.PermView, rt.getHostVulnerabilities))
+		mux.HandleFunc("GET /api/v1/assets/{assetID}/packages", rt.authz(userdom.PermView, rt.getHostPackages))
+	}
+	if rt.alerts != nil {
+		mux.HandleFunc("POST /api/v1/alerts/test", rt.authz(userdom.PermAdminister, rt.testAlert))
 	}
 	if rt.businessAssets != nil {
 		if rt.eng != nil && rt.findings != nil {
@@ -463,6 +499,11 @@ func (rt *Router) routes() *http.ServeMux {
 			mux.HandleFunc("POST /api/v1/fleet/assets/{id}/processes", rt.authz(userdom.PermOperate, rt.reportEndpointProcesses))
 			mux.HandleFunc("GET /api/v1/fleet/assets/{id}/processes", rt.authz(userdom.PermView, rt.listEndpointProcesses))
 		}
+		if rt.behaviorRebaseliner != nil {
+			// Re-baseline a drifted/poisoned behavior baseline so it re-learns instead of abstaining
+			// permanently (#594 D). PermOperate: resetting a security baseline is an operating action.
+			mux.HandleFunc("POST /api/v1/fleet/assets/{id}/behavior-baseline/rebaseline", rt.authz(userdom.PermOperate, rt.rebaselineBehavior))
+		}
 		if rt.endpointTimeline != nil {
 			// B7 State Timeline (#594): read the per-host timeline projection of accepted telemetry. PermView.
 			mux.HandleFunc("GET /api/v1/fleet/assets/{id}/timeline", rt.authz(userdom.PermView, rt.queryEndpointTimeline))
@@ -506,6 +547,7 @@ func (rt *Router) routes() *http.ServeMux {
 		mux.HandleFunc("GET /api/v1/projects/{key}", rt.authz(userdom.PermView, rt.getProject))
 		mux.HandleFunc("DELETE /api/v1/projects/{key}", rt.authz(userdom.PermOperate, rt.deleteProject))
 		mux.HandleFunc("GET /api/v1/projects/{key}/overview", rt.authz(userdom.PermView, rt.projectOverview))
+		mux.HandleFunc("GET /api/v1/projects/{key}/branches", rt.authz(userdom.PermView, rt.listProjectBranches))
 		mux.HandleFunc("GET /api/v1/projects/{key}/dependency-graph", rt.authz(userdom.PermView, rt.projectDependencyGraph))
 		mux.HandleFunc("GET /api/v1/projects/{key}/dependency-graph/export", rt.authz(userdom.PermView, rt.exportProjectDependencySubtree))
 		mux.HandleFunc("GET /api/v1/projects/{key}/measures", rt.authz(userdom.PermView, rt.getProjectMeasures))
@@ -522,6 +564,9 @@ func (rt *Router) routes() *http.ServeMux {
 			mux.HandleFunc("PUT /api/v1/projects/{key}/profiles/{language}", rt.authz(userdom.PermOperate, rt.assignProjectProfile))
 		}
 		mux.HandleFunc("POST /api/v1/projects/{key}/analyses", rt.authz(userdom.PermOperate, rt.startProjectAnalysis))
+		// A pipeline that ran synapse-cli on its own checkout hands the result to the server here, and
+		// it is recorded through the same recorder as a server analysis.
+		mux.HandleFunc("POST /api/v1/projects/{key}/analyses/import", rt.authz(userdom.PermOperate, rt.importProjectAnalysis))
 		mux.HandleFunc("GET /api/v1/projects/{key}/analyses", rt.authz(userdom.PermView, rt.listProjectAnalyses))
 		mux.HandleFunc("GET /api/v1/projects/{key}/analyses/{id}", rt.authz(userdom.PermView, rt.getProjectAnalysis))
 		mux.HandleFunc("POST /api/v1/projects/{key}/analyses/{id}/source", rt.authz(userdom.PermOperate, rt.publishProjectSource))
@@ -554,13 +599,38 @@ func (rt *Router) routes() *http.ServeMux {
 		// not be the only one who can stop it.
 		mux.HandleFunc("POST /api/v1/redteam/halt", rt.authz(userdom.PermAdminister, rt.haltOffensiveWork))
 	}
+	if rt.offensivePolicy != nil {
+		mux.HandleFunc("GET /api/v1/redteam/policy", rt.authz(userdom.PermView, rt.getOffensivePolicy))
+	}
+	if rt.responses != nil {
+		// Governed defensive response (#425): plan (dry run), apply, revert, list. PermOperate to act,
+		// PermView to list; a machine approver is refused inside the use case, and the kill switch cancels
+		// pending actions.
+		mux.HandleFunc("POST /api/v1/blueteam/engagements/{id}/response/plan", rt.authz(userdom.PermOperate, rt.planResponse))
+		mux.HandleFunc("POST /api/v1/blueteam/engagements/{id}/response/apply", rt.authz(userdom.PermOperate, rt.applyResponse))
+		mux.HandleFunc("POST /api/v1/blueteam/response/{id}/revert", rt.authz(userdom.PermOperate, rt.revertResponse))
+		mux.HandleFunc("GET /api/v1/blueteam/response", rt.authz(userdom.PermView, rt.listResponses))
+	}
+	if rt.connectors != nil {
+		// Source-control connectors: tenant-scoped git-host + PAT bindings that let a server-initiated
+		// scan clone a PRIVATE repository. PermAdminister to manage; the token is write-only (sealed on
+		// create, never returned), and the acquirer resolves it by host at clone time.
+		mux.HandleFunc("GET /api/v1/connectors", rt.authz(userdom.PermAdminister, rt.listConnectors))
+		mux.HandleFunc("POST /api/v1/connectors", rt.authz(userdom.PermAdminister, rt.createConnector))
+		mux.HandleFunc("DELETE /api/v1/connectors/{id}", rt.authz(userdom.PermAdminister, rt.deleteConnector))
+	}
 	mux.HandleFunc("GET /api/v1/engagements", rt.authz(userdom.PermView, rt.listEngagements))
 	mux.HandleFunc("GET /api/v1/engagements/{id}", rt.authz(userdom.PermView, rt.getEngagement))
+	// Lifecycle transition. Two spellings reach the same handler: the original PATCH on the
+	// engagement row, and the resource-shaped PUT on its status that clients and the guide document.
+	// Both are described in api/openapi.yaml.
 	mux.HandleFunc("PATCH /api/v1/engagements/{id}", rt.authz(userdom.PermOperate, rt.transitionEngagement))
+	mux.HandleFunc("PUT /api/v1/engagements/{id}/status", rt.authz(userdom.PermOperate, rt.transitionEngagement))
 	mux.HandleFunc("PUT /api/v1/engagements/{id}/scope", rt.authz(userdom.PermOperate, rt.updateScope))
 	mux.HandleFunc("PUT /api/v1/engagements/{id}/authorization-window", rt.authz(userdom.PermOperate, rt.setAuthorizationWindow))
 	mux.HandleFunc("PUT /api/v1/engagements/{id}/roe", rt.authz(userdom.PermOperate, rt.setRoE))
 	mux.HandleFunc("PUT /api/v1/engagements/{id}/live-recon", rt.authz(userdom.PermOperate, rt.setLiveRecon))
+	mux.HandleFunc("PUT /api/v1/engagements/{id}/offensive-roe", rt.authz(userdom.PermOperate, rt.setOffensiveRoE))
 	mux.HandleFunc("GET /api/v1/engagements/{id}/findings", rt.authz(userdom.PermView, rt.withEngTenant(rt.listFindings)))
 	mux.HandleFunc("POST /api/v1/engagements/{id}/findings", rt.authz(userdom.PermOperate, rt.withEngTenant(rt.createFinding)))
 	if rt.detectionProvenance != nil {
@@ -584,6 +654,12 @@ func (rt *Router) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/v1/engagements/{id}/risk-stories/{assetID}", rt.authz(userdom.PermView, rt.withEngTenant(rt.getRiskStory)))
 	if rt.purpleCoverage != nil {
 		mux.HandleFunc("GET /api/v1/engagements/{id}/purple-coverage", rt.authz(userdom.PermView, rt.withEngTenant(rt.listPurpleCoverage)))
+	}
+	if rt.purpleTeam != nil {
+		mux.HandleFunc("POST /api/v1/engagements/{id}/emulation", rt.authz(userdom.PermOperate, rt.withEngTenant(rt.runEmulation)))
+	}
+	if rt.chainRehearsal != nil {
+		mux.HandleFunc("POST /api/v1/engagements/{id}/exploitation/rehearsals", rt.authz(userdom.PermOperate, rt.withEngTenant(rt.rehearseChain)))
 	}
 	mux.HandleFunc("GET /api/v1/engagements/{id}/scan", rt.authz(userdom.PermView, rt.withEngTenant(rt.latestScan)))
 	mux.HandleFunc("GET /api/v1/engagements/{id}/source", rt.authz(userdom.PermView, rt.withEngTenant(rt.uploadedSource)))
@@ -616,6 +692,9 @@ func (rt *Router) routes() *http.ServeMux {
 		mux.HandleFunc("POST /api/v1/engagements/{id}/judgments/{jid}/runtime-verification/proposals", rt.authz(userdom.PermOperate, rt.withEngTenant(rt.proposeRuntimeVerification)))
 		mux.HandleFunc("POST /api/v1/engagements/{id}/dast/approvals/{aid}/decide", rt.authz(userdom.PermReview, rt.withEngTenant(rt.decideRuntimeVerification)))
 		mux.HandleFunc("POST /api/v1/engagements/{id}/judgments/{jid}/runtime-verification/proposals/{aid}/run", rt.authz(userdom.PermOperate, rt.withEngTenant(rt.runRuntimeVerification)))
+		if rt.dastRun != nil {
+			mux.HandleFunc("GET /api/v1/engagements/{id}/dast/runs/{rid}", rt.authz(userdom.PermView, rt.withEngTenant(rt.getDASTRun)))
+		}
 	}
 	if rt.dastScan != nil {
 		mux.HandleFunc("POST /api/v1/engagements/{id}/dast/proposals", rt.authz(userdom.PermOperate, rt.withEngTenant(rt.proposeDASTScan)))
@@ -653,24 +732,39 @@ func (rt *Router) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/engagements/import", rt.authz(userdom.PermOperate, rt.importBundle))
 	mux.HandleFunc("GET /api/v1/engagements/{id}/findings/{fid}/retests", rt.authz(userdom.PermView, rt.withEngTenant(rt.listRetests)))
 	mux.HandleFunc("POST /api/v1/engagements/{id}/findings/{fid}/retests", rt.authz(userdom.PermTriage, rt.withEngTenant(rt.recordRetest)))
-	// Audit is oversight data and is NOT yet tenant-scoped (global), so it is gated to the
-	// sign-off capability (reviewer/admin) rather than the view floor.
+	// Audit is oversight data: reads are tenant-scoped by the store (Postgres enforces it with
+	// the audit_log RLS policy from migration 0086; the file store filters on the bound tenant),
+	// and the route is gated to the sign-off capability (reviewer/admin) rather than the view
+	// floor. Legacy v1 rows predate tenant chaining and are visible to no tenant by design.
 	mux.HandleFunc("GET /api/v1/audit", rt.authz(userdom.PermReview, rt.listAudit))
 	mux.HandleFunc("GET /api/v1/audit/verify", rt.authz(userdom.PermReview, rt.verifyAudit))
+	if rt.capabilities != nil {
+		// Optional-subsystem catalog: configuration booleans only, so the view floor is the right
+		// gate. It must stay registered whatever else is off — a client uses it to tell a disabled
+		// subsystem from a broken one.
+		mux.HandleFunc("GET /api/v1/capabilities", rt.authz(userdom.PermView, rt.listCapabilities))
+	}
 	mux.HandleFunc("GET /api/v1/me", rt.currentUser)
+	// User management is administer-only and confined to the caller's own tenant. Deleting a user is
+	// deliberately absent: an identity owns its audit, evidence, and finding attribution, so access is
+	// revoked by disabling the account or rotating its key, never by removing the row.
 	mux.HandleFunc("GET /api/v1/users", rt.authz(userdom.PermAdminister, rt.listUsers))
 	mux.HandleFunc("POST /api/v1/users", rt.authz(userdom.PermAdminister, rt.createUser))
+	mux.HandleFunc("PATCH /api/v1/users/{id}", rt.authz(userdom.PermAdminister, rt.updateUser))
+	mux.HandleFunc("POST /api/v1/users/{id}/disable", rt.authz(userdom.PermAdminister, rt.disableUser))
+	mux.HandleFunc("POST /api/v1/users/{id}/enable", rt.authz(userdom.PermAdminister, rt.enableUser))
+	mux.HandleFunc("POST /api/v1/users/{id}/rotate-key", rt.authz(userdom.PermAdminister, rt.rotateUserAPIKey))
 	if rt.vulnerabilitySources != nil && rt.vulnerabilityMonitor != nil {
 		mux.HandleFunc("GET /api/v1/vulnerability/sources/types", rt.authz(userdom.PermView, rt.listVulnerabilityAdapterTypes))
 		mux.HandleFunc("GET /api/v1/vulnerability/sources", rt.authz(userdom.PermView, rt.listVulnerabilitySources))
-		mux.HandleFunc("POST /api/v1/vulnerability/sources", rt.authz(userdom.PermAdminister, rt.createVulnerabilitySource))
-		mux.HandleFunc("PUT /api/v1/vulnerability/sources/{id}", rt.authz(userdom.PermAdminister, rt.updateVulnerabilitySource))
-		mux.HandleFunc("PATCH /api/v1/vulnerability/sources/{id}", rt.authz(userdom.PermAdminister, rt.updateVulnerabilitySource))
-		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/enable", rt.authz(userdom.PermAdminister, rt.setVulnerabilitySourceEnabled))
-		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/disable", rt.authz(userdom.PermAdminister, rt.setVulnerabilitySourceEnabled))
-		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/archive", rt.authz(userdom.PermAdminister, rt.archiveVulnerabilitySource))
-		mux.HandleFunc("POST /api/v1/vulnerability/sources/test", rt.authz(userdom.PermAdminister, rt.testVulnerabilitySourceDraft))
-		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/test", rt.authz(userdom.PermAdminister, rt.testVulnerabilitySource))
+		mux.HandleFunc("POST /api/v1/vulnerability/sources", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.createVulnerabilitySource)))
+		mux.HandleFunc("PUT /api/v1/vulnerability/sources/{id}", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.updateVulnerabilitySource)))
+		mux.HandleFunc("PATCH /api/v1/vulnerability/sources/{id}", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.updateVulnerabilitySource)))
+		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/enable", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.setVulnerabilitySourceEnabled)))
+		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/disable", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.setVulnerabilitySourceEnabled)))
+		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/archive", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.archiveVulnerabilitySource)))
+		mux.HandleFunc("POST /api/v1/vulnerability/sources/test", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.testVulnerabilitySourceDraft)))
+		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/test", rt.authz(userdom.PermAdminister, rt.requirePlatformAdmin(rt.testVulnerabilitySource)))
 		mux.HandleFunc("POST /api/v1/vulnerability/sources/{id}/sync", rt.authz(userdom.PermOperate, rt.startVulnerabilitySync))
 		mux.HandleFunc("POST /api/v1/vulnerability/sync-all", rt.authz(userdom.PermOperate, rt.startAllVulnerabilitySync))
 		if rt.vulnerabilityRead != nil {
@@ -777,7 +871,7 @@ func (rt *Router) Handler() http.Handler {
 	human := rt.auth.Middleware(public, rt.requireAUP(aupExempt, routes))
 	// Attach a method-aware route pattern before auth/AUP can reject a known human
 	// route. ServeMux returns an empty pattern for unknown paths and method mismatches.
-	human = annotateRoutePattern(routes, human)
+	human = annotateRoutePattern(routes, limitRequestBody(human))
 	var complete http.Handler
 	if rt.fleet == nil {
 		complete = normalizePath(human)

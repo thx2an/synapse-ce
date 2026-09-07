@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react'
 import { AlertTriangle, Plus, Save01, Trash01 } from '@untitledui/icons'
 import { Button, Card, ErrorState, Field, Input, Pill, Select, cn } from '../../components/ui'
+import { Checkbox } from '../../components/base/checkbox/checkbox'
+import { ConfirmDialog } from '../../components/synapse/ConfirmDialog'
+import { useToast } from '../../components/synapse/Toast'
 import { useFetch } from '../../hooks'
 import { api } from '../../lib/api'
 import { kindLabel } from '../../lib/format'
@@ -16,6 +19,7 @@ export function SettingsTab({ eng, onUpdated }: { eng: Engagement; onUpdated: (e
       <ScopeEditorCard eng={eng} onUpdated={onUpdated} />
       <WindowEditorCard eng={eng} onUpdated={onUpdated} />
       <RoeEditorCard eng={eng} onUpdated={onUpdated} />
+      <OffensiveRoeCard eng={eng} onUpdated={onUpdated} />
       <LiveReconCard eng={eng} onUpdated={onUpdated} />
     </div>
   )
@@ -129,21 +133,49 @@ export const LIFECYCLE_NEXT: Record<string, { status: string; label: string; var
   archived: [],
 }
 
+/** Statuses with no outbound transition: entering one cannot be undone from the UI. */
+export const TERMINAL_STATUSES = new Set(
+  Object.entries(LIFECYCLE_NEXT)
+    .filter(([, transitions]) => transitions.length === 0)
+    .map(([status]) => status),
+)
+
+export function isTerminalStatus(status: string): boolean {
+  return TERMINAL_STATUSES.has(status)
+}
+
 export function LifecycleCard({ eng, onUpdated }: { eng: Engagement; onUpdated: (e: Engagement) => void }) {
   const [busy, setBusy] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [pending, setPending] = useState<{ status: string; label: string } | null>(null)
+  const { notify } = useToast()
   const next = LIFECYCLE_NEXT[eng.status] ?? []
 
   async function go(status: string) {
     setBusy(status)
     setErr(null)
     try {
-      onUpdated(await api.transitionEngagement(eng.id, status))
+      const updated = await api.transitionEngagement(eng.id, status)
+      onUpdated(updated)
+      setPending(null)
+      notify(`Engagement is now ${status}.`, 'success')
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Transition failed')
+      const message = e instanceof Error ? e.message : 'Transition failed'
+      setErr(message)
+      notify(message, 'error')
     } finally {
       setBusy(null)
     }
+  }
+
+  // A terminal transition has no way back, so it is confirmed before the PATCH.
+  function request(transition: { status: string; label: string }) {
+    if (isTerminalStatus(transition.status)) {
+      setErr(null)
+      setPending(transition)
+      return
+    }
+    void go(transition.status)
   }
 
   return (
@@ -153,7 +185,7 @@ export function LifecycleCard({ eng, onUpdated }: { eng: Engagement; onUpdated: 
         <StatusPill status={eng.status} />
         <span className="hidden text-quaternary sm:inline">·</span>
         <span className="text-xs text-quaternary">
-          {eng.status === 'archived' ? 'Terminal state' : 'Scope and authorization enforced on every run'}
+          {isTerminalStatus(eng.status) ? 'Terminal state' : 'Scope and authorization enforced on every run'}
         </span>
         <div className="ml-auto flex flex-wrap gap-2">
           {next.length === 0 ? (
@@ -165,7 +197,7 @@ export function LifecycleCard({ eng, onUpdated }: { eng: Engagement; onUpdated: 
                 variant={n.variant}
                 loading={busy === n.status}
                 disabled={busy !== null}
-                onClick={() => go(n.status)}
+                onClick={() => request(n)}
               >
                 {n.label}
               </Button>
@@ -173,11 +205,30 @@ export function LifecycleCard({ eng, onUpdated }: { eng: Engagement; onUpdated: 
           )}
         </div>
       </div>
-      {err && (
+      {err && !pending && (
         <div className="mt-2">
           <ErrorState message={err} />
         </div>
       )}
+      <ConfirmDialog
+        open={pending !== null}
+        title={`${pending?.label ?? 'Archive'} this engagement?`}
+        description={
+          <>
+            <strong className="font-semibold text-primary">{eng.name}</strong> moves to{' '}
+            <span className="font-mono">{pending?.status}</span>, which is a terminal state: there is no transition
+            back, and scans and edits stay closed from then on.
+          </>
+        }
+        confirmLabel={pending?.label ?? 'Archive'}
+        busy={busy !== null}
+        error={err}
+        onConfirm={() => pending && go(pending.status)}
+        onCancel={() => {
+          setPending(null)
+          setErr(null)
+        }}
+      />
     </Card>
   )
 }
@@ -292,6 +343,143 @@ export function TargetList({
         <Plus className="size-3.5" /> Add target
       </button>
     </div>
+  )
+}
+
+const RISK_CEILINGS = [
+  { value: '', label: 'Unset (offensive actions refused)' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'prohibited', label: 'Prohibited (no offensive actions)' },
+]
+
+// OffensiveRoeCard captures the rules of engagement the offensive governance policy requires before
+// adversary emulation or exploitation chains may run. The readiness pill mirrors the policy's own
+// required-field check, so an operator sees at a glance why offensive actions would be refused.
+export function OffensiveRoeCard({ eng, onUpdated }: { eng: Engagement; onUpdated: (e: Engagement) => void }) {
+  const roe = eng.offensiveRoe ?? { customerContact: '', emergencyContact: '', riskCeiling: '', exclusionsChecked: false }
+  const [customer, setCustomer] = useState(roe.customerContact)
+  const [emergency, setEmergency] = useState(roe.emergencyContact)
+  const [ceiling, setCeiling] = useState(roe.riskCeiling)
+  const [checked, setChecked] = useState(roe.exclusionsChecked)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    setCustomer(roe.customerContact)
+    setEmergency(roe.emergencyContact)
+    setCeiling(roe.riskCeiling)
+    setChecked(roe.exclusionsChecked)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eng.id])
+
+  // Readiness mirrors the offensive policy's required fields: RoE fields here plus the window and scope
+  // captured in the other cards.
+  const windowSet = !!eng.authorizedFrom && !!eng.authorizedTo
+  const scopeSet = eng.inScope.length > 0
+  const roeComplete =
+    roe.customerContact !== '' && roe.emergencyContact !== '' && roe.riskCeiling !== '' && roe.exclusionsChecked
+  const ready = roeComplete && windowSet && scopeSet
+
+  const missing: string[] = []
+  if (roe.customerContact === '') missing.push('customer contact')
+  if (roe.emergencyContact === '') missing.push('emergency contact')
+  if (roe.riskCeiling === '') missing.push('risk ceiling')
+  if (!roe.exclusionsChecked) missing.push('exclusions review')
+  if (!windowSet) missing.push('authorization window')
+  if (!scopeSet) missing.push('in-scope target')
+
+  async function save() {
+    setBusy(true)
+    setErr(null)
+    setSaved(false)
+    try {
+      onUpdated(
+        await api.setOffensiveRoE(eng.id, {
+          customerContact: customer.trim(),
+          emergencyContact: emergency.trim(),
+          riskCeiling: ceiling,
+          exclusionsChecked: checked,
+        }),
+      )
+      setSaved(true)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Failed to save rules of engagement')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Card
+      title="Offensive rules of engagement"
+      actions={
+        <div className="flex items-center gap-2">
+          <Pill className={ready ? 'text-success-primary' : 'text-warning-primary'}>
+            {ready ? 'Offensive ready' : 'Incomplete'}
+          </Pill>
+          <Button loading={busy} onClick={save} variant="secondary-color" className="px-3 py-1.5">
+            <Save01 className="size-4" /> Save rules
+          </Button>
+        </div>
+      }
+    >
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <Field label="Customer contact" hint="Who to reach on the customer side">
+          <Input
+            value={customer}
+            onChange={(e) => setCustomer(e.target.value)}
+            placeholder="Name <email> / phone"
+            aria-label="Customer contact"
+          />
+        </Field>
+        <Field label="Emergency contact" hint="Out-of-hours contact">
+          <Input
+            value={emergency}
+            onChange={(e) => setEmergency(e.target.value)}
+            placeholder="Name <email> / phone"
+            aria-label="Emergency contact"
+          />
+        </Field>
+        <Field label="Risk ceiling" hint="Highest risk class an action may carry">
+          <Select
+            value={ceiling}
+            onValueChange={setCeiling}
+            size="sm"
+            aria-label="Risk ceiling"
+            options={RISK_CEILINGS}
+          />
+        </Field>
+        <Field label="Excluded assets reviewed">
+          <div className="pt-1.5">
+            <Checkbox
+              isSelected={checked}
+              onChange={setChecked}
+              label="The out-of-scope list was reviewed"
+            />
+          </div>
+        </Field>
+      </div>
+      {!ready && (
+        <div className="mt-4 flex items-start gap-2 rounded-xl border border-warning-primary/40 bg-warning-primary/10 p-3">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning-primary" aria-hidden="true" />
+          <div className="text-xs">
+            <span className="font-semibold text-warning-primary">Offensive actions blocked.</span>{' '}
+            <span className="text-secondary">
+              Adversary emulation and exploitation chains are refused until this engagement's rules of
+              engagement, authorization window and scope are complete.
+            </span>
+            <div className="mt-1.5 text-secondary">
+              <span className="font-medium text-primary">Missing:</span> {missing.join(', ')}
+            </div>
+          </div>
+        </div>
+      )}
+      {saved && <p className="mt-2 text-[11px] text-success-primary">Rules of engagement saved.</p>}
+      {err && <p className="mt-2 text-[11px] text-error-primary">{err}</p>}
+    </Card>
   )
 }
 

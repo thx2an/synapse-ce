@@ -6,23 +6,38 @@ This guide takes you from a clone to a running dashboard, then through a first s
 
 ## 1. Start the stack
 
-The fastest path is Docker, which runs PostgreSQL, MinIO, the API, and the dashboard. Create a local env file first; the Compose stack deliberately has no default database passwords or DSNs:
+The fastest path is Docker, which runs PostgreSQL, MinIO, the API, and the dashboard. Create a local env file first; the Compose stack deliberately has no default database passwords or DSNs, so that a first run cannot come up on a credential that is printed in this guide:
 
 ```bash
-cat > deploy/.env.local <<'EOF'
-DB_ADMIN_PASSWORD=replace-with-a-strong-local-admin-password
-DB_APP_PASSWORD=replace-with-a-different-local-app-password
-BLOB_PASSWORD=replace-with-a-third-local-password
-SYNAPSE_API_TOKEN=replace-with-a-random-token
-SYNAPSE_DB_DSN=postgres://synapse_app:replace-with-a-different-local-app-password@postgres:5432/synapse?sslmode=disable
-SYNAPSE_DB_MIGRATION_DSN=postgres://synapse_admin:replace-with-a-strong-local-admin-password@postgres:5432/synapse?sslmode=disable
+umask 077
+DB_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+DB_APP_PASSWORD="$(openssl rand -hex 16)"
+BLOB_PASSWORD="$(openssl rand -hex 16)"
+cat > deploy/.env.local <<EOF
+DB_ADMIN_PASSWORD=$DB_ADMIN_PASSWORD
+DB_APP_PASSWORD=$DB_APP_PASSWORD
+BLOB_PASSWORD=$BLOB_PASSWORD
+SYNAPSE_API_TOKEN=$(openssl rand -hex 32)
+SYNAPSE_DB_DSN=postgres://synapse_app:$DB_APP_PASSWORD@postgres:5432/synapse?sslmode=disable
+SYNAPSE_DB_MIGRATION_DSN=postgres://synapse_admin:$DB_ADMIN_PASSWORD@postgres:5432/synapse?sslmode=disable
 EOF
 
 docker compose --env-file deploy/.env.local \
-  -f deploy/docker-compose.full.yml up --build
+  -f deploy/docker-compose.full.yml up -d --build --wait
 ```
 
-Keep `deploy/.env.local` out of version control and use URL-safe passwords in these example DSNs. For passwords containing URL-reserved characters, percent-encode the password component or supply a correctly encoded complete DSN. Reusing an existing PostgreSQL volume with different credentials causes authentication failures; preserve the original credentials or, for disposable local data only, reset with `docker compose --env-file deploy/.env.local -f deploy/docker-compose.full.yml down -v` before starting again.
+`--env-file` is required: Compose does not read `deploy/.env.local` merely because the Compose file lives in `deploy/`. `--wait` holds until every service is healthy, including the one-shot containers that create the database role and the evidence bucket. The first build compiles the Go binaries and the dashboard bundle, so expect it to take a while; later runs reuse the layers.
+
+Confirm both surfaces before moving on:
+
+```bash
+curl localhost:8080/readyz                                  # {"status":"ready",...}
+curl -s -o /dev/null -w '%{http_code}\n' localhost:5173/    # 200
+```
+
+`SYNAPSE_DB_DSN` names `synapse_app`, a `NOSUPERUSER NOBYPASSRLS` role, and `SYNAPSE_DB_MIGRATION_DSN` names the schema owner. Both are required and must differ: the API refuses to serve under a role that can bypass row level security, and it grants the runtime role its table privileges after migrating as the owner.
+
+Keep `deploy/.env.local` out of version control; `.gitignore` already covers `.env.local`. Hex passwords are URL-safe; percent-encode reserved characters in any DSN you write by hand. Reusing an existing PostgreSQL volume with different credentials causes authentication failures; preserve the original credentials or, for disposable local data only, reset with `docker compose --env-file deploy/.env.local -f deploy/docker-compose.full.yml down -v` before starting again.
 
 This Compose profile is for an isolated local development machine. It publishes the API, PostgreSQL, MinIO, and dashboard ports and deliberately disables the Linux sandbox because plain containers cannot run bubblewrap. Do not expose it to an untrusted network or submit untrusted targets. Use the hardened deployment requirements in [Deployment](deployment.md) for real assessments.
 
@@ -36,6 +51,21 @@ export PATH="$PWD/bin:$PATH"
 export SYNAPSE_API_TOKEN="$(openssl rand -hex 32)"   # required, no anonymous access
 make dev                                             # API on :8080, dashboard on :5173
 ```
+
+To back the native API with PostgreSQL instead of the in-memory stores, start the dependency stack and export both DSNs. Its one-shot `postgres-init` container creates the `synapse_app` role that the API connects as.
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d   # Postgres + MinIO, project synapse-dev
+# The stack's own defaults; set these in deploy/.env to use anything else.
+export DB_PASSWORD="${DB_PASSWORD:-synapse}" DB_APP_PASSWORD="${DB_APP_PASSWORD:-synapse-app}"
+export SYNAPSE_DB_DSN="postgres://synapse_app:${DB_APP_PASSWORD}@localhost:5432/synapse?sslmode=disable"
+export SYNAPSE_DB_MIGRATION_DSN="postgres://synapse:${DB_PASSWORD}@localhost:5432/synapse?sslmode=disable"
+make dev
+```
+
+These are throwaway local credentials. Pointing `SYNAPSE_DB_DSN` at the `synapse` superuser stops startup with `rls: runtime DB role cannot enforce isolation: role is SUPERUSER`, which is the server refusing to pretend that tenant isolation holds.
+
+Skip `--wait` on this stack: Compose treats the exited `postgres-init` container as not running and reports a failure even when it exited 0. `docker compose -f deploy/docker-compose.yml run --rm postgres-init` blocks until the role exists and is idempotent.
 
 `SYNAPSE_API_TOKEN` is the only required development setting. The server refuses to start without it.
 Operational API routes require it; liveness `GET /healthz` and dependency readiness `GET /readyz` are
@@ -80,8 +110,13 @@ generates the SBOM and runs detection.
 Two constraints are enforced server-side, so it is worth knowing them before the first attempt:
 
 - A local target must be an **absolute path** that the API process can read. A relative path is rejected.
-- Container image and archive targets are **not yet supported on this endpoint**. To scan an image today,
-  use the CLI: `synapse-cli scan alpine:3.19 --image`.
+- A **container image** target is supported: set the kind to `image` and give a reference such as
+  `docker.io/library/alpine:3.19`. The server pulls it daemonlessly (crane) and reports its OS and
+  language package CVEs. The image must be in the engagement scope. The CLI form is
+  `synapse-cli scan alpine:3.19 --image`.
+- An **archive** is not scanned by reference on this endpoint; upload it through the source-upload flow.
+- A **private git repository** is cloned when its host has a source-control connector configured in
+  Settings (a personal access token, sealed server-side). Without a connector, only public repos clone.
 
 **Import a client SBOM.** If the client handed you a CycloneDX SBOM, use Import SBOM on the
 engagement. That makes their inventory a first-class, attested artifact. To then compute

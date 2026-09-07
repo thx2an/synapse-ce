@@ -5,7 +5,9 @@ import { AuthProvider, useAuth } from './auth/AuthContext'
 import { ErrorBoundary } from './components/layout/ErrorBoundary'
 import { LoadingFallback } from './components/layout/LoadingFallback'
 import { MobileSidebar, Sidebar } from './components/layout/Sidebar'
+import { ToastProvider } from './components/synapse/Toast'
 import { Connect } from './pages/Connect'
+import { NotFound } from './pages/NotFound'
 
 // --- Lazy-loaded page components ---
 const Dashboard = lazy(() => import('./pages/Dashboard/DashboardPage').then(m => ({ default: m.DashboardPage })))
@@ -26,6 +28,10 @@ const QualityGates = lazy(() => import('./pages/CodeQuality/QualityGates').then(
 const QualityProfiles = lazy(() => import('./pages/CodeQuality/QualityProfiles').then(m => ({ default: m.QualityProfiles })))
 const FleetCoverage = lazy(() => import('./pages/Fleet/FleetCoverage').then(m => ({ default: m.FleetCoverage })))
 const Incidents = lazy(() => import('./pages/Fleet/Incidents').then(m => ({ default: m.Incidents })))
+const Hosts = lazy(() => import('./pages/Fleet/Hosts').then(m => ({ default: m.Hosts })))
+const CoverageWindows = lazy(() => import('./pages/Fleet/CoverageWindows').then(m => ({ default: m.CoverageWindows })))
+const Workloads = lazy(() => import('./pages/Fleet/Workloads').then(m => ({ default: m.Workloads })))
+const HostDetail = lazy(() => import('./pages/Fleet/HostDetail').then(m => ({ default: m.HostDetail })))
 const IncidentDetail = lazy(() => import('./pages/Fleet/IncidentDetail').then(m => ({ default: m.IncidentDetail })))
 const Rules = lazy(() => import('./pages/Rules/index'))
 const RuleDetail = lazy(() => import('./pages/Rules/RuleDetail'))
@@ -33,11 +39,17 @@ const Audit = lazy(() => import('./pages/Settings/Audit').then(m => ({ default: 
 const Settings = lazy(() => import('./pages/Settings/Settings').then(m => ({ default: m.Settings })))
 const SettingsConfig = lazy(() => import('./pages/Settings/SettingsConfig').then(m => ({ default: m.SettingsConfig })))
 const Integrations = lazy(() => import('./pages/Settings/Integrations').then(m => ({ default: m.Integrations })))
+const Connectors = lazy(() => import('./pages/Settings/Connectors').then(m => ({ default: m.Connectors })))
+const TelemetryPrivacy = lazy(() => import('./pages/Settings/TelemetryPrivacy').then(m => ({ default: m.TelemetryPrivacy })))
+const ResponseOps = lazy(() => import('./pages/BlueTeam/ResponseOps').then(m => ({ default: m.ResponseOps })))
 const AITriageReviews = lazy(() => import('./pages/AITriage/AITriageReviews').then(m => ({ default: m.AITriageReviews })))
 const AITriageObservability = lazy(() => import('./pages/AITriage/AITriageObservability').then(m => ({ default: m.AITriageObservability })))
 const VulnerabilityIntelligence = lazy(() => import('./pages/VulnerabilityIntelligence').then(m => ({ default: m.VulnerabilityIntelligence })))
 const VulnerabilityAdvisoryPage = lazy(() => import('./pages/VulnerabilityIntelligence/VulnIntelAdvisories').then(m => ({ default: m.VulnerabilityAdvisoryPage })))
 const Team = lazy(() => import('./pages/Settings/Team').then(m => ({ default: m.Team })))
+const SLAPolicy = lazy(() => import('./pages/Settings/SLAPolicy').then(m => ({ default: m.SLAPolicy })))
+const OffensivePolicy = lazy(() => import('./pages/Settings/OffensivePolicy').then(m => ({ default: m.OffensivePolicy })))
+const Alerting = lazy(() => import('./pages/Settings/Alerting').then(m => ({ default: m.Alerting })))
 const ProjectOverviewPage = lazy(() => import('./pages/CodeQuality/ProjectOverviewPage').then(m => ({ default: m.ProjectOverviewPage })))
 const ProjectAnalysisPage = lazy(() => import('./pages/CodeQuality/ProjectAnalysisPage').then(m => ({ default: m.ProjectAnalysisPage })))
 const ProjectActivityPage = lazy(() => import('./pages/CodeQuality/ProjectActivityPage').then(m => ({ default: m.ProjectActivityPage })))
@@ -50,7 +62,9 @@ const ProjectDependencyGraphPage = lazy(() => import('./pages/CodeQuality/Projec
 export default function App() {
   return (
     <AuthProvider>
-      <Gate />
+      <ToastProvider>
+        <Gate />
+      </ToastProvider>
     </AuthProvider>
   )
 }
@@ -91,7 +105,12 @@ function Gate() {
         </Route>
         <Route path="fleet" element={<FleetCoverage />} />
         <Route path="fleet/agents" element={<Navigate to="/fleet" replace />} />
+        <Route path="fleet/hosts" element={<Hosts />} />
+        <Route path="fleet/coverage-windows" element={<CoverageWindows />} />
+        <Route path="fleet/workloads" element={<Workloads />} />
+        <Route path="fleet/hosts/:id" element={<HostDetail />} />
         <Route path="fleet/incidents" element={<Incidents />} />
+        <Route path="blueteam/response" element={<ResponseOps />} />
         <Route path="fleet/incidents/:id" element={<IncidentDetail />} />
         <Route path="rules" element={<Rules />} />
         <Route path="rules/:key" element={<RuleDetail />} />
@@ -99,7 +118,12 @@ function Gate() {
           <Route index element={<Audit />} />
           <Route path="team" element={<Team />} />
           <Route path="integrations" element={<Integrations />} />
+          <Route path="connectors" element={<Connectors />} />
+          <Route path="privacy" element={<TelemetryPrivacy />} />
           <Route path="config" element={<SettingsConfig />} />
+          <Route path="sla" element={<SLAPolicy />} />
+          <Route path="offensive-policy" element={<OffensivePolicy />} />
+          <Route path="alerting" element={<Alerting />} />
         </Route>
         <Route path="audit" element={<Navigate to="/settings" replace />} />
         <Route path="team" element={<Navigate to="/settings/team" replace />} />
@@ -107,7 +131,7 @@ function Gate() {
         <Route path="ai-triage/observability" element={<AITriageObservability />} />
         <Route path="vulnerability-intelligence" element={<VulnerabilityIntelligence />} />
         <Route path="vulnerability-intelligence/advisories/:advisoryId" element={<VulnerabilityAdvisoryPage />} />
-        <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>
   )
@@ -118,6 +142,20 @@ function Shell() {
   const location = useLocation()
   return (
     <div className="h-screen overflow-hidden bg-primary md:grid md:grid-cols-[auto_1fr]">
+      <a
+        href="#main-content"
+        onClick={(e) => {
+          // The shell scrolls inside <main>, so move focus explicitly instead of
+          // relying on a fragment navigation the router would swallow.
+          e.preventDefault()
+          const main = document.getElementById('main-content')
+          main?.focus()
+          main?.scrollTo({ top: 0 })
+        }}
+        className="sr-only z-[110] rounded-lg bg-brand-solid px-4 py-2 text-sm font-semibold text-primary_on-brand shadow-lg focus:not-sr-only focus:absolute focus:left-4 focus:top-4"
+      >
+        Skip to main content
+      </a>
       <Sidebar />
       <MobileSidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
       <div className="flex min-h-0 min-w-0 flex-col bg-primary md:pt-4">
@@ -132,7 +170,11 @@ function Shell() {
             <Menu01 className="size-5" />
           </button>
         </div>
-        <main className="flex-1 overflow-auto bg-secondary-subtle p-4 sm:p-6 xl:p-8 md:rounded-tl-[40px] md:border-t md:border-l md:border-secondary md:shadow-md">
+        <main
+          id="main-content"
+          tabIndex={-1}
+          className="flex-1 overflow-auto bg-secondary-subtle p-4 sm:p-6 xl:p-8 outline-none md:rounded-tl-[40px] md:border-t md:border-l md:border-secondary md:shadow-md"
+        >
           <ErrorBoundary key={location.pathname}>
             <Suspense fallback={<LoadingFallback />}>
               <Outlet />

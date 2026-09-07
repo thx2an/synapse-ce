@@ -27,6 +27,30 @@ export interface RoE {
   blackouts: Blackout[]
 }
 
+/**
+ * One optional subsystem this deployment either switched on or left off.
+ *
+ * Wire shape: `capabilityView` in internal/adapter/httpapi/capability_handler.go.
+ * `switch` is the name of the `SYNAPSE_*` variable an operator sets, never its value.
+ * `requires` lists the keys of capabilities this one needs, so an enabled switch that still
+ * yields a disabled subsystem can be explained.
+ */
+export interface Capability {
+  key: string
+  name: string
+  enabled: boolean
+  switch: string
+  requires: string[]
+}
+
+/** Offensive rules of engagement. riskCeiling is '' | 'low' | 'medium' | 'high' | 'prohibited'. */
+export interface OffensiveRoe {
+  customerContact: string
+  emergencyContact: string
+  riskCeiling: string
+  exclusionsChecked: boolean
+}
+
 export interface Engagement {
   id: string
   name: string
@@ -38,6 +62,9 @@ export interface Engagement {
   authorizedTo: string | null
   roe: RoE
   liveReconEnabled: boolean
+  /** Offensive rules of engagement the governance policy requires before emulation / exploitation.
+   *  Always populated by mapEngagement from the API; optional here so lightweight fixtures may omit it. */
+  offensiveRoe?: OffensiveRoe
   createdAt: string | null
   businessAssetId: string
   /** List-view enrichment. Absent unless the API includes it; the Engagements
@@ -45,6 +72,8 @@ export interface Engagement {
   findingsCount?: EngagementFindingsCount
   /** List-view enrichment; see findingsCount. */
   lastScanDate?: string | null
+  /** Status of the latest scan job (running, succeeded, failed); present with lastScanDate. */
+  lastScanStatus?: string
 }
 
 export interface EngagementFindingsCount {
@@ -388,6 +417,27 @@ export interface ScanManifest {
   reproScore: number
   pinnedInputs: string[]
   unpinnedInputs: string[]
+}
+
+// One persisted scan execution: its manifest (reproducibility inputs) plus the
+// finding identity keys present in the run, enough to list history and compute drift.
+export interface ScanRun {
+  id: string
+  engagementId: string
+  createdAt: string
+  manifest: ScanManifest
+  findingKeys: string[]
+}
+
+// The difference between two scan runs: which finding keys appeared or disappeared,
+// and the manifest deltas that explain why a result legitimately changed.
+export interface ScanDrift {
+  runA: ScanRun
+  runB: ScanRun
+  added: string[]
+  removed: string[]
+  unchanged: number
+  explanation: string[]
 }
 
 export interface LicenseFinding {
@@ -1030,9 +1080,23 @@ export interface ProjectGateInfo {
   source: 'managed' | 'repository' | 'default' | ''
 }
 
+export type ProjectAnalysisOrigin = 'server' | 'ci'
+
+/** What a pipeline said about the run that produced an analysis. Unverified by the server. */
+export interface ProjectAnalysisCI {
+  provider: string
+  runUrl: string
+  runId: string
+  branch: string
+  actor: string
+}
+
 export interface ProjectAnalysis {
   id: string
   createdAt: string
+  /** Who produced it: the server scanning the source itself, or a pipeline that pushed the result. */
+  origin: ProjectAnalysisOrigin
+  ci: ProjectAnalysisCI | null
   sourceRef: string
   sourceCommit: string
   gate: ProjectGateResult
@@ -1501,6 +1565,63 @@ export interface FleetAgentRow {
   currentWork: number
 }
 
+// Fleet host vulnerabilities (#820). Wire shape: hostSummaryDTO / hostVulnerabilitiesDTO in
+// internal/adapter/httpapi/host_vulnerability_handler.go.
+export interface HostScan {
+  jobId: string
+  status: 'running' | 'succeeded' | 'failed'
+  stage: string
+  error: string
+  startedAt: string | null
+  finishedAt: string | null
+}
+
+export interface HostVulnerabilitySummary {
+  total: number
+  critical: number
+  high: number
+  medium: number
+  low: number
+  info: number
+  fixable: number
+  kev: number
+}
+
+export interface HostRow {
+  asset: TechnicalAsset
+  engagementId: string // empty until the host reports packages
+  packages: number
+  recordedAt: string | null
+  lastScan: HostScan | null
+  summary: HostVulnerabilitySummary
+}
+
+export interface HostFinding extends Finding {
+  cvssScore: number
+  fixedVersion: string
+  advisoryId: string
+  sources: string[]
+  confidence: string
+  detectionState: string
+}
+
+export interface HostVulnerabilities extends HostRow {
+  findings: HostFinding[]
+}
+
+export interface HostPackage {
+  name: string
+  version: string
+  purl: string
+}
+
+export interface HostPackages {
+  assetId: string
+  engagementId: string
+  recordedAt: string | null
+  packages: HostPackage[]
+}
+
 export interface FleetOrderBrief {
   id: string
   capability: string
@@ -1644,6 +1765,31 @@ export interface TimelineEntry {
 // One agent security detection record (#594 B/C). detection.Record + its Detection are untagged
 // PascalCase; evidence event details are field-RBAC redacted server-side, so the UI shows the summary.
 export type AgentDetectionClass = 'process' | 'network' | 'file' | 'privilege' | ''
+
+/** A finding a third-party tool produced and a pipeline imported through the SARIF route. It is held
+ *  apart from first-party findings on purpose: it entered under governance, it cannot promote itself,
+ *  and its provenance (tool, version, digest, who imported it) is the point of showing it. */
+export interface ImportedFinding {
+  id: string
+  findingId: string
+  severity: Severity
+  title: string
+  message: string
+  path: string
+  startLine: number
+  startColumn: number
+  logicalName: string
+  suppressedByTool: boolean
+  fingerprint: string
+  external: boolean
+  canSelfPromote: boolean
+  tool: string
+  toolVersion: string
+  rule: string
+  sourceDigest: string
+  ingestedBy: string
+  ingestedAt: string
+}
 
 export interface AgentDetectionRecord {
   id: string

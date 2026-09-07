@@ -7,7 +7,7 @@
 | Component | Notes |
 | --- | --- |
 | Go 1.26 | Pinned in `go.mod`. Builds cgo-free, so the container image is distroless. |
-| Node 20 and pnpm 9 | For the web dashboard. Use pnpm, not npm or yarn. |
+| Node 22 and pnpm | For the web dashboard. Use pnpm, not npm or yarn. |
 | Syft | Required for any scan. Generates the SBOM. |
 | Grype | Optional. Adds the offline vulnerability database. Missing means detection degrades to the live source only. |
 | PostgreSQL | Optional for development, required for durable persistence, the fleet, scheduled provider work, and the owned advisory store. |
@@ -66,6 +66,22 @@ docker compose -f deploy/docker-compose.full.yml up --build
 ```
 
 See [Deployment](deployment.md) for the image targets and a production checklist.
+
+### With Kubernetes (Helm)
+
+The chart in `deploy/helm/synapse` installs the control plane on any cluster. Its `execution.mode`
+selects the shape: `controlPlaneOnly` (the offline scanner console, boots on managed EKS/GKE and
+`kind`), `externalNative` (production control plane on Kubernetes with a native execution tier per
+ADR 0008), and `inClusterBroker` (in-cluster execution via an opt-in privileged egress-broker
+DaemonSet). Try it against a local `kind` cluster:
+
+```bash
+make kind-smoke       # deploy execution.mode=controlPlaneOnly and assert the control plane serves
+```
+
+The runtime database role must be `NOSUPERUSER NOBYPASSRLS`; Synapse refuses to serve on a superuser
+role because it bypasses the row-level security that isolates tenants. See
+[Deployment](deployment.md) for the mode matrix, the egress placements, and the production checklist.
 
 ## Verify
 

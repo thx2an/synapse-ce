@@ -28,16 +28,19 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/adapter/observability"
 	"github.com/KKloudTarus/synapse-ce/internal/composition/scacompose"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/agent"
+	"github.com/KKloudTarus/synapse-ce/internal/domain/alerting"
 	ap "github.com/KKloudTarus/synapse-ce/internal/domain/attackpath"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/cloudposture"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/correlation"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/evidence"
 	integrationdom "github.com/KKloudTarus/synapse-ce/internal/domain/integration"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/judgment"
+	"github.com/KKloudTarus/synapse-ce/internal/domain/offensivepolicy"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/riskassessment"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/shared"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/taint"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/vulnerabilityreconcile"
+	alertwebhook "github.com/KKloudTarus/synapse-ce/internal/infrastructure/alertsink/webhook"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/blob"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/dastchecks"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/dastengine"
@@ -91,6 +94,7 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/platform/worksign"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/agenttools"
 	aitriagereviewuc "github.com/KKloudTarus/synapse-ce/internal/usecase/aitriagereviewuc"
+	alertinguc "github.com/KKloudTarus/synapse-ce/internal/usecase/alerting"
 	analysisuc "github.com/KKloudTarus/synapse-ce/internal/usecase/analysis"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/approval"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/assetuc"
@@ -98,16 +102,20 @@ import (
 	audituc "github.com/KKloudTarus/synapse-ce/internal/usecase/audit"
 	aupuc "github.com/KKloudTarus/synapse-ce/internal/usecase/aup"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/businessassetuc"
+	capabilitiesuc "github.com/KKloudTarus/synapse-ce/internal/usecase/capabilities"
+	chainrehearsaluc "github.com/KKloudTarus/synapse-ce/internal/usecase/chainrehearsal"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/codequality"
 	credentialsuc "github.com/KKloudTarus/synapse-ce/internal/usecase/credentials"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/crosscheckjudge"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/cspm"
+	dastrunuc "github.com/KKloudTarus/synapse-ce/internal/usecase/dastrun"
 	dastrunneruc "github.com/KKloudTarus/synapse-ce/internal/usecase/dastrunner"
 	dastsessionuc "github.com/KKloudTarus/synapse-ce/internal/usecase/dastsession"
 	dastverifieruc "github.com/KKloudTarus/synapse-ce/internal/usecase/dastverifier"
 	dastworkflowuc "github.com/KKloudTarus/synapse-ce/internal/usecase/dastworkflow"
 	egresspolicy "github.com/KKloudTarus/synapse-ce/internal/usecase/egress"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/egressgrant"
+	emulationuc "github.com/KKloudTarus/synapse-ce/internal/usecase/emulation"
 	enguc "github.com/KKloudTarus/synapse-ce/internal/usecase/engagement"
 	evidenceuc "github.com/KKloudTarus/synapse-ce/internal/usecase/evidence"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/execution"
@@ -127,12 +135,14 @@ import (
 	exposureuc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/exposureuc"
 	fleetaudit "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/fleetaudit"
 	hostinventoryuc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/hostinventory"
+	hostvulnuc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/hostvuln"
 	incidenttriage "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/incidenttriage"
 	incidentuc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/incidentuc"
 	keyregistry "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/keyregistry"
 	legalholduc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/legalholduc"
 	privacyexport "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/privacyexport"
 	privacypolicy "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/privacypolicy"
+	"github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/processreport"
 	retrohunt "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/retrohunt"
 	riskscorebridge "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/riskscorebridge"
 	riskscoreuc "github.com/KKloudTarus/synapse-ce/internal/usecase/fleet/riskscoreuc"
@@ -151,6 +161,8 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/ports"
 	projectuc "github.com/KKloudTarus/synapse-ce/internal/usecase/projectuc"
 	promotionuc "github.com/KKloudTarus/synapse-ce/internal/usecase/promotion"
+	"github.com/KKloudTarus/synapse-ce/internal/usecase/purplecoverage"
+	purpleteamuc "github.com/KKloudTarus/synapse-ce/internal/usecase/purpleteam"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/pyreach"
 	qualitygatesuc "github.com/KKloudTarus/synapse-ce/internal/usecase/qualitygates"
 	qualityprofilesuc "github.com/KKloudTarus/synapse-ce/internal/usecase/qualityprofiles"
@@ -158,12 +170,14 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/reachproof"
 	reconuc "github.com/KKloudTarus/synapse-ce/internal/usecase/recon"
 	reportuc "github.com/KKloudTarus/synapse-ce/internal/usecase/report"
+	responseuc "github.com/KKloudTarus/synapse-ce/internal/usecase/response"
 	riskstoryuc "github.com/KKloudTarus/synapse-ce/internal/usecase/riskstoryuc"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/rules"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/safety"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/sarifingest"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/sbomcrosscheckjudge"
 	scauc "github.com/KKloudTarus/synapse-ce/internal/usecase/sca"
+	"github.com/KKloudTarus/synapse-ce/internal/usecase/scmconnectoruc"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/slauc"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/srcreach"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/taintscan"
@@ -304,6 +318,7 @@ func main() {
 	var attackPathStore ports.AttackPathStore
 	var scannedImageStore ports.ScannedImageStore
 	var workOrderStore ports.WorkOrderStore
+	var responseStore ports.ResponseStore
 	var fleetAgentStore ports.FleetAgentStore
 	var agentSigningKeyStore ports.AgentSigningKeyStore // A0.2 signing-key registry (A3 resolve+verify)
 	var telemetryTransportStore interface {
@@ -320,6 +335,7 @@ func main() {
 	var privacyPolicyStore ports.PrivacyPolicyAuditStore  // #611 immutable source-redaction policy history
 	var coverageWindowStore ports.CoverageWindowStore     // #611 immutable coverage-window revisions
 	var endpointProcessStore ports.EndpointProcessStore   // #594 B5 per-host running-process projection
+	var fleetProcessReportSvc *processreport.Service      // #594 D: agent running-process report -> behavior baseline
 	var fleetDesiredStore ports.FleetDesiredStore         // #633 desired-vs-observed capability state
 	var endpointTimelineStore ports.EndpointTimelineStore // #594 B7 State Timeline projection
 	var baselineStore ports.BaselineStore                 // #594 D behavioral baseline state
@@ -345,8 +361,14 @@ func main() {
 	var scanResultStore ports.ScanResultStore
 	var aiTriageReviewStore ports.AITriageReviewStore
 	var importedSBOMStore ports.ImportedSBOMStore
-	var importedFindingStore ports.ImportedFindingStore         // third-party (SARIF) findings under governance
-	var detectionRecordStore ports.DetectionRecordStore         // #423 detection ledger projection
+	var importedFindingStore ports.ImportedFindingStore // third-party (SARIF) findings under governance
+	var detectionRecordStore ports.DetectionRecordStore // #423 detection ledger projection
+	var purpleCoverageStore ports.PurpleCoverageStore   // #426 emulated technique vs observed detection
+	var emulationRunStore emulationuc.RunStore          // #426 adversary-emulation run producer
+	var exploitChainStore exploitationuc.ChainStore     // governed exploitation chain rehearsal store
+	// Registry of the LLM agent runs executing in this process, so the offensive kill switch can cancel
+	// one mid-decision. Declared here because the kill switch is built before the orchestrator is.
+	agentRunRegistry := orchestrator.NewRunRegistry()
 	var detectionProvenanceStore ports.DetectionProvenanceStore // #610 durable detection lifecycle facts
 	var incidentEventStore ports.IncidentEventStore             // #594 C7 incident append-only event log
 	var promotionStore ports.PendingPromotionAuditStore
@@ -358,6 +380,7 @@ func main() {
 	var qualityGateMutator ports.QualityGateMutator
 	var reconRunStore ports.ReconRunStore
 	var cloudRunStore ports.CloudRunStore
+	var dastRunStore ports.DASTRunStore
 	var cloudObservationStore ports.CloudObservationStore
 	var evidenceStore ports.EvidenceStore
 	var advisoryStore ports.AdvisoryStore         // owned normalized-advisory store (global reference data, not tenant-scoped)
@@ -367,8 +390,9 @@ func main() {
 	var auditLog ports.IdempotentAuditLogger
 	var timestampStore ports.TimestampStore
 	var credVault ports.CredentialVault
-	var reconQueue ports.JobQueue         // durable queue for recon-via-worker (Postgres only)
-	var vulnerabilityQueue ports.JobQueue // continuous vulnerability sync queue
+	var scmConnectorStore ports.SCMConnectorStore // tenant-scoped source-control connectors (private-repo clone auth)
+	var reconQueue ports.JobQueue                 // durable queue for recon-via-worker (Postgres only)
+	var vulnerabilityQueue ports.JobQueue         // continuous vulnerability sync queue
 	var vulnerabilitySourceStore ports.VulnerabilitySourceStore
 	var vulnerabilityRunStore ports.SyncRunStore
 	var vulnerabilityMaterializer ports.AdvisoryMaterializer
@@ -480,6 +504,9 @@ func main() {
 		importedSBOMStore = postgres.NewImportedSBOMStore(pool)
 		importedFindingStore = postgres.NewImportedFindingRepository(pool)
 		detectionRecordStore = postgres.NewDetectionRecordRepository(pool)
+		purpleCoverageStore = postgres.NewPurpleRepository(pool)
+		emulationRunStore = postgres.NewEmulationRunRepository(pool)
+		exploitChainStore = postgres.NewExploitationChainRepository(pool)
 		detectionProvenanceStore, err = postgres.NewDetectionProvenanceRepository(pool)
 		if err != nil {
 			log.Error("postgres detection provenance store init failed", "err", err)
@@ -498,6 +525,7 @@ func main() {
 		qualityProfileStore = postgres.NewQualityProfileStore(pool)
 		reconRunStore = postgres.NewReconRunStore(pool)
 		cloudRunStore = postgres.NewCloudRunStore(pool)
+		dastRunStore = postgres.NewDASTRunStore(pool)
 		cloudObservationStore = postgres.NewCloudObservationStore(pool)
 		evidenceStore = postgres.NewEvidenceStore(pool)
 		advisoryStore = postgres.NewAdvisoryRepository(pool)
@@ -507,6 +535,7 @@ func main() {
 		attackPathStore = postgres.NewAttackPathStore(pool)
 		scannedImageStore = postgres.NewScannedImageStore(pool)
 		workOrderStore = postgres.NewWorkOrderRepository(pool)
+		responseStore = postgres.NewResponseRepository(pool)
 		fleetAgentStore = postgres.NewFleetAgentRepository(pool)
 		agentSigningKeyStore = postgres.NewAgentSigningKeyRepository(pool)
 		telemetryTransportStore, err = postgres.NewTelemetryTransportRepository(pool)
@@ -553,6 +582,12 @@ func main() {
 		qualityGateMutator = postgres.NewQualityGateMutator(pool)
 		timestampStore = postgres.NewTimestampStore(pool)
 		credVault = vault.NewPostgresVault(pool, vaultCipher)
+		scmRepo, scmErr := postgres.NewSCMConnectorRepository(pool, vaultCipher)
+		if scmErr != nil {
+			log.Error("source-control connector store init failed", "err", scmErr)
+			os.Exit(1)
+		}
+		scmConnectorStore = scmRepo
 		reconQueue = postgres.NewJobQueue(pool, ids)
 		vulnerabilityQueue = reconQueue
 		postgresIntegrationStore := postgres.NewIntegrationStore(pool, vaultCipher)
@@ -584,6 +619,7 @@ func main() {
 		attackPathStore = memory.NewAttackPathStore()
 		scannedImageStore = memory.NewScannedImageStore()
 		workOrderStore = memory.NewWorkOrderStore()
+		responseStore = memory.NewResponseStore()
 		fleetAgentStore = memory.NewFleetAgentStore()
 		agentSigningKeyStore = memory.NewAgentSigningKeyStore()
 		telemetryTransportStore = memory.NewTelemetryTransportStore()
@@ -615,6 +651,9 @@ func main() {
 		importedSBOMStore = memory.NewImportedSBOMStore()
 		importedFindingStore = memory.NewImportedFindingStore()
 		detectionRecordStore = memory.NewDetectionRecordStore()
+		purpleCoverageStore = memory.NewPurpleStore()
+		emulationRunStore = memory.NewEmulationRunStore()
+		exploitChainStore = memory.NewExploitationChainStore()
 		detectionProvenanceStore = memory.NewDetectionProvenanceStore()
 		incidentEventStore = memory.NewIncidentEventStore()
 		memoryFindings, ok := findingRepo.(*memory.FindingRepository)
@@ -640,6 +679,7 @@ func main() {
 		qualityProfileStore = memory.NewQualityProfileStore()
 		reconRunStore = memory.NewReconRunRepository()
 		cloudRunStore = memory.NewCloudRunStore()
+		dastRunStore = memory.NewDASTRunStore()
 		cloudObservationStore = memory.NewCloudObservationStore()
 		evidenceStore = memory.NewEvidenceStore()
 		advisoryStore = memory.NewAdvisoryStore()
@@ -651,6 +691,7 @@ func main() {
 		qualityGateMutator = memory.NewQualityGateMutator(qualityGateStore.(*memory.QualityGateStore), projectRepo.(*memory.ProjectRepository), auditLog)
 		timestampStore = memory.NewTimestampStore()
 		credVault = vault.NewMemoryVault(vaultCipher, nil)
+		scmConnectorStore = memory.NewSCMConnectorStore()
 		vulnerabilityQueue = memory.NewJobQueue(ids, clock.Now)
 		integrationStore = memory.NewIntegrationStore(vulnerabilityQueue, vaultCipher, clock, auditLog)
 		integrationMatcher = memory.MissingIntegrationAnalysisMatcher{}
@@ -699,6 +740,9 @@ func main() {
 	}
 	projectService.SetArchiveStore(file.NewProjectArchiveStore(cfg.ProjectUploadDir, cfg.MaxWorkspaceBytes))
 	projectService.SetAnalysisStore(projectAnalysisStore)
+	// A pipeline-imported analysis leaves a scan-job record, so the project's status and job history
+	// show the CI run exactly as they show a server run.
+	projectService.SetScanJobs(scanJobStore)
 	if issueStore, ok := projectAnalysisStore.(ports.ProjectIssueStore); ok {
 		projectService.SetIssueStore(issueStore)
 	} else {
@@ -836,7 +880,7 @@ func main() {
 		detectionSources = []ports.DetectionSource{dispatchOnly}
 		log.Info("SCA execution adapters omitted from dispatch-only API")
 	} else {
-		execution, eerr := scacompose.BuildExecution(cfg, log, advisoryStore)
+		execution, eerr := scacompose.BuildExecution(cfg, log, advisoryStore, scmConnectorStore)
 		if eerr != nil {
 			log.Error(eerr.Error())
 			os.Exit(1)
@@ -920,6 +964,11 @@ func main() {
 	if err != nil {
 		log.Error("vex service init failed", "err", err)
 		os.Exit(1)
+	}
+	if vulnerabilityTransactions != nil {
+		// One VEX document retires many findings. Without a transaction each retirement commits
+		// on its own, so a failure part way through leaves some findings retired and the rest not.
+		vexService.SetTransactionRunner(vulnerabilityTransactions)
 	}
 
 	// Recon orchestration: one shared execution guard, an argv-only
@@ -1058,6 +1107,12 @@ func main() {
 		log.Error("users service init failed", "err", err)
 		os.Exit(1)
 	}
+	if vulnerabilityTransactions != nil {
+		// The last-admin guard counts the roster and then writes. Both statements must be one
+		// transaction, or two concurrent demotions each see the other admin still enabled and the
+		// tenant is left with nobody who can administer it.
+		usersService.SetTransactionRunner(vulnerabilityTransactions)
+	}
 	if err := usersService.EnsureBootstrapAdmin(context.Background(), cfg.APIToken); err != nil {
 		log.Error("bootstrap admin seed failed", "err", err)
 		os.Exit(1)
@@ -1090,6 +1145,11 @@ func main() {
 		log.Error("approval service init failed", "err", err)
 		os.Exit(1)
 	}
+	if vulnerabilityTransactions != nil {
+		// A human's approve or deny and its audit record commit together, so an operator is
+		// never told the decision failed while the agent acts on it.
+		approvalSvc.SetTransactionRunner(vulnerabilityTransactions)
+	}
 	safetyGate, err := safety.NewGate(reconGuard, approvalSvc, evidenceService)
 	if err != nil {
 		log.Error("safety gate init failed", "err", err)
@@ -1097,6 +1157,10 @@ func main() {
 	}
 	router := httpapi.NewRouter(log, auth, engService, scaService, aupService, findingsService, exportService, reportService, evidenceService, reconService, logBroker, transferService, auditService, vexService, usersService, credentialsService)
 	router.SetIntegrations(integrationService)
+	if summaries, ok := findingRepo.(ports.FindingSummaryReader); ok {
+		router.SetFindingSummaries(summaries)
+	}
+	router.SetScanJobs(scanJobStore)
 	coverageWindowSvc, err := coveragewindow.NewService(sensorStateStore, telemetryTransportStore, telemetryTransportStore, coverageWindowStore, clock)
 	if err != nil {
 		log.Error("coverage window service init failed", "err", err)
@@ -1143,6 +1207,32 @@ func main() {
 		log.Error("fleet audit reconciliation runner init failed", "err", err)
 		os.Exit(1)
 	}
+	// Optional-subsystem catalog for GET /api/v1/capabilities: every field is one resolved
+	// SYNAPSE_* switch, so a client can tell a disabled subsystem from a broken one.
+	capabilitySvc, err := capabilitiesuc.NewService(capabilitiesuc.Flags{
+		Fleet:                cfg.FleetEnabled,
+		FleetAssets:          cfg.FleetAssetsEnabled,
+		FleetHostIngest:      cfg.FleetHostIngestEnabled,
+		FleetClusterIngest:   cfg.FleetClusterIngestEnabled,
+		FleetTelemetryIngest: cfg.FleetTelemetryIngestEnabled,
+		FleetDetectionIngest: cfg.FleetDetectionIngestEnabled,
+		CSPM:                 cfg.CSPMEnabled,
+		Agent:                cfg.AgentEnabled,
+		FPTriage:             cfg.FPTriageEnabled,
+		SLA:                  cfg.SLAEnabled,
+		Judgments:            cfg.JudgmentsEnabled,
+		Sandbox:              cfg.SandboxEnabled,
+		WriteupDrafts:        cfg.WriteupDraftsEnabled,
+		Taint:                cfg.TaintEnabled,
+		JSReachability:       cfg.JSReachabilityEnabled,
+		SingleTenant:         cfg.SingleTenant,
+		OIDC:                 cfg.OIDCEnabled,
+	})
+	if err != nil {
+		log.Error("capability catalog init failed", "err", err)
+		os.Exit(1)
+	}
+	router.SetCapabilities(capabilitySvc)
 	router.SetCoverageWindowReader(coverageWindowStore)
 	router.SetPrivacyPolicyService(privacyPolicySvc)
 	if cfg.OIDCEnabled {
@@ -1225,6 +1315,7 @@ func main() {
 		os.Exit(1)
 	}
 	vulnerabilityRegistry := vulnerabilitymonitor.NewRegistry()
+	vulnerabilityRegistry.AllowPrivateNetworkSources(cfg.VulnerabilitySourceAllowPrivateNetwork)
 	if err := vulnerabilityprovider.RegisterAll(vulnerabilityRegistry, vulnerabilityprovider.Dependencies{
 		LookupCanonical: vulnerabilityMaterializer.GetCanonical,
 		CurrentRecords:  vulnerabilityMaterializer.CurrentSourceRecordIDs,
@@ -1246,6 +1337,7 @@ func main() {
 		log.Error("vulnerability source service init failed", "err", err)
 		os.Exit(1)
 	}
+	vulnerabilitySourceService.AllowPrivateNetworkSources(cfg.VulnerabilitySourceAllowPrivateNetwork)
 	vulnerabilityProjection, err := vulnerabilityprojection.NewService(findingRepo)
 	if err != nil {
 		log.Error("vulnerability finding projection init failed", "err", err)
@@ -1375,6 +1467,17 @@ func main() {
 	}
 	log.Info("immutable project source capture ENABLED", "retention", cfg.ProjectSourceRetention)
 	router.SetProjects(projectService)
+	// Source-control connectors: tenant-scoped git-host + PAT bindings so a server-initiated scan can
+	// clone a PRIVATE repository. The same store is the acquirer's clone-time credential resolver.
+	if scmConnectorStore != nil {
+		connectorSvc, connErr := scmconnectoruc.NewService(scmConnectorStore, ids, clock)
+		if connErr != nil {
+			log.Error("source-control connector service init failed", "err", connErr)
+			os.Exit(1)
+		}
+		router.SetConnectors(connectorSvc)
+		log.Info("source-control connectors ENABLED (manage at /api/v1/connectors; private-repo clone auth)")
+	}
 	router.SetQualityGates(qualityGateService)
 	router.SetQualityProfiles(qualityProfileService)
 	if memoryAssets, ok := assetStore.(*memory.AssetStore); ok {
@@ -1416,7 +1519,7 @@ func main() {
 	var judgmentSvc *analysisuc.Service                   // shared by the HTTP verify/accept routes + the agent propose tool
 	var promotionEval *promotionuc.Evaluator              // optional source-signal reevaluator; proposes only
 	var promotionRunner *promotionuc.ReconciliationRunner // server-only promotion recovery
-	if cfg.JudgmentsEnabled {                             // AI judgment lifecycle (verify/accept/list); off by default
+	if cfg.JudgmentsEnabled {                             // AI judgment lifecycle (verify/accept/list); on by default
 		svc, aerr := analysisuc.NewService(judgmentStore, evidenceService, auditLog, clock, ids)
 		if aerr != nil {
 			log.Error("analysis (judgment) service init failed", "err", aerr)
@@ -1502,6 +1605,20 @@ func main() {
 					os.Exit(1)
 				}
 				router.SetDASTWorkflow(dastWorkflowSvc)
+				// #823 durable DAST verification: with the Postgres job queue, the run route enqueues a
+				// worker job (executed by synapse-worker's dast_run handler) instead of running the probe
+				// on the request thread, and a status route polls it. Without the queue (in-memory dev)
+				// the run stays synchronous. The submit-side service carries no prober; only the worker
+				// executes.
+				if reconQueue != nil {
+					dastRunSvc, drerr := dastrunuc.NewService(dastRunStore, nil, auditLog, clock, ids)
+					if drerr != nil {
+						log.Error("DAST durable run service init failed", "err", drerr)
+						os.Exit(1)
+					}
+					router.SetDASTRunner(dastRunSvc)
+					log.Info("DAST verification runs execute on the worker (durable)", "route", "POST .../runtime-verification/proposals/{aid}/run")
+				}
 				engine, eerr := dastengine.New(reconRunner, cfg.DASTHelperBin, cfg.DASTMaxWallClock, cfg.ReconMaxOutput)
 				if eerr != nil {
 					log.Error("authenticated DAST engine init failed", "err", eerr)
@@ -1553,6 +1670,52 @@ func main() {
 		os.Exit(1)
 	}
 	var assetSvc *assetuc.Service
+	// Offensive policy register (#823): the binary, not a document, decides which techniques are prohibited.
+	// An invalid register is a startup failure; the validated register is exposed read-only to operators.
+	offensiveRegister, oerr := offensivepolicy.Load()
+	if oerr != nil {
+		log.Error("offensive policy register failed validation; refusing to start", "err", oerr)
+		os.Exit(1)
+	}
+	router.SetOffensivePolicy(offensiveRegister)
+	log.Info("offensive policy register loaded", "techniques", len(offensiveRegister.TechniqueIDs()), "counsel_reviewed", offensiveRegister.LegalReview.CounselReviewed, "route", "GET /api/v1/redteam/policy")
+
+	// The offensive governance SERVICE (not just the register): it authorizes one technique against one
+	// target under an engagement's rules of engagement, sealing the authorization as evidence. It gates the
+	// offensive pillar (adversary emulation now, exploitation chains next), so an incomplete RoE refuses.
+	offensiveSealer := offensivepolicyuc.NewEvidenceChainSealer(func(ctx context.Context, engagementID shared.ID, kind string, content []byte, createdBy string) (shared.ID, error) {
+		ev, serr := evidenceService.Seal(ctx, engagementID, kind, content, createdBy)
+		if serr != nil {
+			return "", serr
+		}
+		return ev.ID, nil
+	})
+	offensivePolicySvc, operr := offensivepolicyuc.NewService(offensiveRegister, offensiveSealer, auditLog)
+	if operr != nil {
+		log.Error("offensive policy service init failed", "err", operr)
+		os.Exit(1)
+	}
+
+	// Operator alerting (#822): a signed webhook that receives every incident correlation opens, plus the
+	// correlator handle detection ingest uses so an incident exists as soon as its detections are sealed.
+	var alertSvc *alertinguc.Service
+	if cfg.AlertWebhookURL != "" {
+		rule := alerting.Rule{MinSeverity: shared.Severity(strings.ToLower(strings.TrimSpace(cfg.AlertMinSeverity)))}
+		sink, aerr := alertwebhook.New(cfg.AlertWebhookURL, cfg.AlertWebhookSecret, 10*time.Second, cfg.AlertWebhookAllowPrivate, cfg.AlertWebhookAllowUnsigned)
+		if aerr != nil {
+			log.Error("alert webhook init failed (SYNAPSE_ALERT_WEBHOOK_URL / SYNAPSE_ALERT_WEBHOOK_SECRET)", "err", aerr)
+			os.Exit(1)
+		}
+		var aerr2 error
+		alertSvc, aerr2 = alertinguc.NewService([]ports.AlertSink{sink}, rule, auditLog, clock, ids)
+		if aerr2 != nil {
+			log.Error("alerting init failed (SYNAPSE_ALERT_MIN_SEVERITY)", "err", aerr2)
+			os.Exit(1)
+		}
+		router.SetAlerts(alertSvc)
+		log.Info("operator alerting ENABLED (signed webhook; POST /api/v1/alerts/test sends a test alert)", "min_severity", rule.MinSeverity)
+	}
+	var incidentCorrelator *correlationuc.Service
 	if cfg.FleetAssetsEnabled {
 		svc, derr := assetuc.NewService(assetStore, auditLog, clock, ids)
 		if derr != nil {
@@ -1695,6 +1858,30 @@ func main() {
 		} else {
 			router.SetRiskStoryReader(riskStorySvc)
 		}
+		// #426 purple coverage: join each emulated ATT&CK technique against the detections actually
+		// observed on that asset inside the run's window, so the report answers "did we see it?"
+		// rather than "did we run it?". The domain, the use case and the route already existed and
+		// were tested; the composition root never built the service, so the route was registered
+		// against a nil reader and did not exist on a running server.
+		if purpleSvc, perr := purplecoverage.NewService(purpleCoverageStore, detectionRecordStore, auditLog, clock); perr != nil {
+			log.Error("purple coverage init failed", "err", perr)
+			os.Exit(1)
+		} else {
+			router.SetPurpleCoverageReader(purpleSvc)
+			// #426 producer: run the governed adversary-emulation catalogue and compute the coverage the
+			// reader above serves, so the purple panel shows measured coverage instead of an empty store.
+			// Emulation runs through a no-host SimulationExecutor; the real host executor stays a deliberate
+			// extension point.
+			if emulationRunStore != nil {
+				ptSvc, pterr := purpleteamuc.NewService(repo, offensivePolicySvc, exploitationuc.SimulationExecutor{}, emulationRunStore, purpleSvc, auditLog, clock, ids)
+				if pterr != nil {
+					log.Error("purple-team emulation producer init failed", "err", pterr)
+					os.Exit(1)
+				}
+				router.SetPurpleTeam(ptSvc)
+				log.Info("adversary emulation ENABLED (governed, no-host simulation)", "route", "POST /api/v1/engagements/{id}/emulation")
+			}
+		}
 		// The ingest writes an append-only audit entry asserting that N external results entered an
 		// engagement. Without Postgres those rows live only in this process, so the banner says so
 		// rather than letting the audit trail imply a durability the deployment does not have.
@@ -1731,13 +1918,34 @@ func main() {
 			log.Error("behavioral baseline service init failed", "err", blErr)
 			os.Exit(1)
 		}
-		behaviorSvc, bhErr := behaviorbaseline.NewService(baselineSvc, endpointProcessStore)
+		// Fold the host's recent per-class detection rate into the behavior baseline (#822): the detection
+		// ledger already stores each detection with its asset and telemetry class, so the network,
+		// privilege and file features the process snapshot cannot carry are read from it. Optional: a
+		// detection store that does not implement the reader (or none) leaves those features at 0.
+		var detRates behaviorbaseline.DetectionRates
+		if dr, ok := detectionRecordStore.(behaviorbaseline.DetectionRates); ok {
+			detRates = dr
+		}
+		behaviorSvc, bhErr := behaviorbaseline.NewService(baselineSvc, endpointProcessStore, detRates, func() time.Time { return clock.Now().UTC() }, 0)
 		if bhErr != nil {
 			log.Error("behavior-baseline producer init failed", "err", bhErr)
 			os.Exit(1)
 		}
 		router.SetEndpointProcesses(endpointProcessStore) // #594 B5: running-process report/read + Exposure running-vs-installed
 		router.SetProcessLearner(behaviorSvc)             // #594 D: learn the process profile on each report
+		router.SetBehaviorRebaseliner(behaviorSvc)        // #594 D: re-baseline a drifted/poisoned baseline instead of abstaining forever
+		router.SetHostAssetVerifier(assetStore)           // refuse operator process/rebaseline on a non-host or unknown asset id
+		// Close the input gap the baseline had (#594 D): the shipped agent reported host packages but
+		// never its processes, so the statistical baseline never saw an observation. This ingests the
+		// agent's running-process report on the transport plane, resolving the host asset server-side from
+		// the authenticated agent, and folds it into the same learner. The route is registered after
+		// SetFleet (below) because it lives on the agent transport plane.
+		if prSvc, prErr := processreport.NewService(telemetryTransportStore, endpointProcessStore, behaviorSvc, clock); prErr != nil {
+			log.Error("process report service init failed", "err", prErr)
+			os.Exit(1)
+		} else {
+			fleetProcessReportSvc = prSvc
+		}
 		// B7 State Timeline + retro-hunt (#594): the timeline projects accepted telemetry per host (fed by
 		// the telemetry-ingest fan-out, wired where telemetrySvc is built), and retro-hunt re-hunts a window
 		// of it. Read-only surfaces (PermView).
@@ -1802,10 +2010,10 @@ func main() {
 			var exposureReader *exposurereader.Reader
 			var xrerr error
 			if componentLister, ok := vulnerabilityInventory.(exposurereader.ComponentLister); ok {
-				exposureReader, xrerr = exposurereader.NewReaderWithRuntime(businessAssetStore, vulnerabilityOccurrences, vulnerabilityAssessments, endpointProcessStore, componentLister)
+				exposureReader, xrerr = exposurereader.NewReaderWithRuntime(businessAssetStore, repo, vulnerabilityOccurrences, vulnerabilityAssessments, endpointProcessStore, componentLister)
 				log.Info("exposure: running-vs-installed ENABLED (B5 process store + component inventory)")
 			} else {
-				exposureReader, xrerr = exposurereader.NewReader(businessAssetStore, vulnerabilityOccurrences, vulnerabilityAssessments)
+				exposureReader, xrerr = exposurereader.NewReader(businessAssetStore, repo, vulnerabilityOccurrences, vulnerabilityAssessments)
 			}
 			if xrerr != nil {
 				log.Error("exposure reader init failed", "err", xrerr)
@@ -1844,8 +2052,12 @@ func main() {
 				log.Error("correlation service init failed", "err", cerr)
 				os.Exit(1)
 			}
+			if alertSvc != nil {
+				corr.SetNotifier(alertSvc)
+			}
+			incidentCorrelator = corr
 			router.SetIncidentCorrelator(corr)
-			log.Warn("fleet correlation ENABLED (detections -> incidents; auto-reassess=" + strconv.FormatBool(triScore != nil) + ") - POST /api/v1/fleet/engagements/{id}/correlate")
+			log.Warn("fleet correlation ENABLED (detections -> incidents on every sealed batch; auto-reassess=" + strconv.FormatBool(triScore != nil) + "; alerting=" + strconv.FormatBool(alertSvc != nil) + ") - POST /api/v1/fleet/engagements/{id}/correlate")
 		}
 	}
 
@@ -1874,6 +2086,23 @@ func main() {
 		// in-flight offensive work order. Wired only where a work order store exists, because a halt
 		// endpoint that accepts a request and stops nothing is the worst possible failure for this
 		// control -- an unwired route 404s instead, which an operator can see.
+		// Governed defensive response (#425): the SAME admission gate exploitation and DAST use, an
+		// argv-only executor, and an append-only ledger. The executor is the SimulationExecutor by
+		// default: it drives the full admission -> human approval -> apply -> telemetry-verify -> revert
+		// loop and records every state, but executes NOTHING on a host. A real host executor is a
+		// deliberate, review-gated extension point (see internal/usecase/response/simulation.go); wiring
+		// it crosses the execution-safety boundary and is left to an explicit operator decision.
+		var responseSvc *responseuc.Service
+		if responseStore != nil {
+			rs, rerr := responseuc.NewService(safetyGate, responseuc.SimulationExecutor{}, responseStore, auditLog, clock)
+			if rerr != nil {
+				log.Error("response service init failed", "err", rerr)
+				os.Exit(1)
+			}
+			responseSvc = rs
+			router.SetResponse(responseSvc, ids)
+			log.Info("governed defensive response ENABLED", "routes", "POST /api/v1/blueteam/engagements/{id}/response/{plan,apply}, POST /api/v1/blueteam/response/{id}/revert", "executor", "simulation (no host effect)")
+		}
 		if killSwitch, kerr := offensivepolicyuc.NewKillSwitch(workOrderStore, auditLog, nil, func() time.Time { return clock.Now().UTC() }); kerr != nil {
 			log.Error("offensive kill switch init failed", "err", kerr)
 			os.Exit(1)
@@ -1884,8 +2113,34 @@ func main() {
 			// which for this single-process deployment is the whole control plane.
 			chainRegistry := exploitationuc.NewChainRegistry()
 			killSwitch.SetChainHalter(chainRegistry)
+			// Chain driver: rehearse a governed exploitation chain as a no-host SIMULATION and register its
+			// Machine here (via RunTracked) so the kill switch can halt it mid-run. This fills the registry
+			// the switch guards and makes chained exploitation reachable; the real host executor and an
+			// independent verifier stay a deliberate, review-gated extension point.
+			chainSealer := chainrehearsaluc.SealerFunc(func(ctx context.Context, engagementID shared.ID, kind string, content []byte, createdBy string) (shared.ID, error) {
+				ev, serr := evidenceService.Seal(ctx, engagementID, kind, content, createdBy)
+				if serr != nil {
+					return "", serr
+				}
+				return ev.ID, nil
+			})
+			if rehearsalSvc, rherr := chainrehearsaluc.NewService(repo, offensivePolicySvc, offensiveRegister, chainRegistry, exploitChainStore, chainSealer, auditLog, clock, ids); rherr != nil {
+				log.Error("exploitation chain rehearsal init failed", "err", rherr)
+				os.Exit(1)
+			} else {
+				router.SetChainRehearsal(rehearsalSvc)
+				log.Info("exploitation chain rehearsal ENABLED (governed, no-host simulation)", "route", "POST /api/v1/engagements/{id}/exploitation/rehearsals")
+			}
+			// Third layer: the LLM agent loop. A run holds no work order and is not a chain, so without
+			// this the halt stopped everything except the thing actively choosing the next action.
+			killSwitch.SetAgentHalter(agentRunRegistry)
+			// Fourth layer: pending defensive-response actions. A halt cancels admitted-but-not-applied
+			// responses so the switch stops the whole estate, offensive and defensive, in one action.
+			if responseSvc != nil {
+				killSwitch.SetResponseHalter(responseSvc)
+			}
 			router.SetOffensiveKillSwitch(killSwitch)
-			log.Info("offensive kill switch ENABLED", "route", "POST /api/v1/redteam/halt", "bound", offensivepolicyuc.HaltBound.String(), "chain_registry", true)
+			log.Info("offensive kill switch ENABLED", "route", "POST /api/v1/redteam/halt", "bound", offensivepolicyuc.HaltBound.String(), "chain_registry", true, "agent_registry", true, "response_registry", responseSvc != nil)
 		}
 		// Optional certificate identity (#408): when a control-plane CA is configured, enrolment
 		// with a CSR issues a client certificate. Fail closed on a misconfigured CA.
@@ -1899,6 +2154,10 @@ func main() {
 			log.Info("fleet agent certificate identity ENABLED (CSR enrolment issues client certs)")
 		}
 		router.SetFleet(agentSvc, workSvc, clock.Now, cfg.FleetClientCertHeader)
+		if fleetProcessReportSvc != nil {
+			router.SetFleetProcessReport(fleetProcessReportSvc)
+			log.Info("agent process reporting ENABLED", "route", "POST /api/v1/fleet/processes", "baseline_learn", true)
+		}
 		router.SetFleetPrivacyPolicyReader(privacyPolicySvc)
 		router.SetFleetAdmin(agentSvc)
 
@@ -1958,8 +2217,20 @@ func main() {
 			if telemetryTransportStore != nil {
 				hiSvc.SetTelemetryBinder(telemetryTransportStore)
 			}
+			// #820: the reported OS packages become the host's SBOM in a hidden per-host engagement and
+			// run through the SCA imported-SBOM pipeline, so host CVEs reach the console per asset.
+			hvSvc, hverr := hostvulnuc.NewService(repo, assetStore, findingsService, scaService, importedSBOMStore, scanJobStore, ids, clock, auditLog)
+			if hverr != nil {
+				log.Error("host vulnerability init failed", "err", hverr)
+				os.Exit(1)
+			}
+			if summaries, ok := findingRepo.(ports.FindingSummaryReader); ok {
+				hvSvc.SetFindingSummaries(summaries)
+			}
+			hiSvc.SetVulnerabilityRecorder(hvSvc)
+			router.SetHostVulnerabilities(hvSvc)
 			router.SetFleetHostInventory(hiSvc)
-			log.Info("fleet host inventory ingest ENABLED (VM agents persist host inventories into the asset model)")
+			log.Info("fleet host inventory ingest ENABLED (VM agents persist host inventories into the asset model; packages are correlated with advisories per host)")
 		}
 
 		// Agent→control-plane telemetry batch ingest (A3, #624): an enrolled agent ships a signed
@@ -2029,6 +2300,14 @@ func main() {
 			if derr != nil {
 				log.Error("fleet detection ingest init failed", "err", derr)
 				os.Exit(1)
+			}
+			if incidentCorrelator != nil {
+				// Correlate on ingest: the batch that seals new detections folds them into incidents at once.
+				corr := incidentCorrelator
+				detectSvc.SetCorrelator(func(ctx context.Context, actor string, engagementID shared.ID) (int, error) {
+					res, err := corr.CorrelateEngagement(ctx, actor, engagementID)
+					return len(res.Created), err
+				})
 			}
 			router.SetFleetDetectionIngest(detectSvc)
 			if telemetrySvc != nil {
@@ -2402,6 +2681,8 @@ func main() {
 		if agentRunLock != nil {
 			orch.SetRunLock(agentRunLock) // advisory session lock – cannot expire mid-LLM-loop
 		}
+		// Make this orchestrator's runs reachable by the offensive kill switch.
+		orch.SetRunRegistry(agentRunRegistry)
 		orch.SetPlanStore(planStore)         // drive a proposed plan DAG (node-CAS idempotency)
 		orch.SetDecisionStore(decisionStore) // structured decision-log projection
 		// Durable dispatch when SYNAPSE_AGENT_VIA_WORKER (requires the recon worker + Postgres):

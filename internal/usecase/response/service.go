@@ -205,9 +205,16 @@ func (s *Service) Apply(ctx context.Context, engagementID shared.ID, action rdom
 	}
 	adm, err := s.admit.Admit(ctx, p, approver)
 	if err != nil {
-		// Record the pending/refused state so the kill switch can see an in-flight action.
+		// Record the pending state durably so the kill switch and the list route see the in-flight
+		// action. If that write fails the 202 would be a lie (nothing to cancel, nothing to resume), so
+		// the persistence error is returned instead of the pending signal.
 		if isPending(err) {
-			_ = s.put(ctx, Record{ID: action.ID, TenantID: tenantID, EngagementID: engagementID, Action: action, State: StatePending, ApprovedBy: approver, UpdatedAt: s.clock.Now().UTC()})
+			pending := Record{ID: action.ID, TenantID: tenantID, EngagementID: engagementID, Action: action, State: StatePending, ApprovedBy: approver, UpdatedAt: s.clock.Now().UTC()}
+			if perr := s.put(ctx, pending); perr != nil {
+				return Record{}, fmt.Errorf("record pending response %s: %w", action.ID, perr)
+			}
+			// Hand the pending record back so the caller learns the server-minted id it can reference.
+			return pending, err
 		}
 		return Record{}, err
 	}
@@ -231,11 +238,16 @@ func (s *Service) Apply(ctx context.Context, engagementID shared.ID, action rdom
 	// declared target is a violation — halted and recorded, mirroring the exploitation rule.
 	if radiusExceeded(action.BlastRadius, out.ObservedRadius) || out.AffectedCount > 1 {
 		rec := s.record(tenantID, engagementID, action, StateViolation, approver, adm.EvidenceID())
-		_ = s.put(ctx, rec)
+		violation := fmt.Errorf("%w: response %s effect exceeded its declared single-target radius (observed=%s affected=%d)", shared.ErrForbidden, action.ID, out.ObservedRadius, out.AffectedCount)
+		// The violation record must persist so the halt/list see the halted action; a lost write is
+		// joined to the violation error, never swallowed (a governed action's state is not best-effort).
+		if err := s.put(ctx, rec); err != nil {
+			return rec, errors.Join(violation, fmt.Errorf("persist response violation %s: %w", action.ID, err))
+		}
 		s.recordAudit(ctx, "response.blast_radius_violation", approver, action, map[string]string{
 			"declared": string(action.BlastRadius), "observed": string(out.ObservedRadius), "affected": fmt.Sprint(out.AffectedCount),
 		})
-		return rec, fmt.Errorf("%w: response %s effect exceeded its declared single-target radius (observed=%s affected=%d)", shared.ErrForbidden, action.ID, out.ObservedRadius, out.AffectedCount)
+		return rec, violation
 	}
 
 	rec := s.record(tenantID, engagementID, action, StateApplied, approver, adm.EvidenceID())
@@ -284,8 +296,23 @@ func (s *Service) Revert(ctx context.Context, actionID shared.ID, target engagem
 		return Record{}, err
 	}
 	// The executed reversal argv is exactly the admitted payload (p.Argv above is rev.Argv).
-	if _, err := s.exec.Execute(ctx, ExecRequest{Argv: rev.Argv, Target: rec.Action.Target, Declared: rec.Action.BlastRadius, IsReversal: true}); err != nil {
+	out, err := s.exec.Execute(ctx, ExecRequest{Argv: rev.Argv, Target: rec.Action.Target, Declared: rec.Action.BlastRadius, IsReversal: true})
+	if err != nil {
 		return Record{}, fmt.Errorf("execute reversal %s: %w", actionID, err)
+	}
+	// A reversal that exceeds its declared single-target radius is a violation, exactly as apply enforces:
+	// the reversal is a first-class governed action and cannot escape the blast-radius rule.
+	if radiusExceeded(rec.Action.BlastRadius, out.ObservedRadius) || out.AffectedCount > 1 {
+		rec.State = StateViolation
+		rec.UpdatedAt = s.clock.Now().UTC()
+		revViolation := fmt.Errorf("%w: reversal of %s effect exceeded its declared single-target radius (observed=%s affected=%d)", shared.ErrForbidden, actionID, out.ObservedRadius, out.AffectedCount)
+		if err := s.put(ctx, rec); err != nil {
+			return rec, errors.Join(revViolation, fmt.Errorf("persist reversal violation %s: %w", actionID, err))
+		}
+		s.recordAudit(ctx, "response.reversal_blast_radius_violation", approver, rec.Action, map[string]string{
+			"declared": string(rec.Action.BlastRadius), "observed": string(out.ObservedRadius), "affected": fmt.Sprint(out.AffectedCount),
+		})
+		return rec, revViolation
 	}
 	rec.State = StateReverted
 	rec.UpdatedAt = s.clock.Now().UTC()
@@ -294,6 +321,12 @@ func (s *Service) Revert(ctx context.Context, actionID shared.ID, target engagem
 	}
 	s.recordAudit(ctx, "response.reverted", approver, rec.Action, map[string]string{"reversal": string(rev.Kind)})
 	return rec, nil
+}
+
+// ListByState returns the tenant's response actions in a state (from ctx tenant), for the operator's
+// view of what is admitted-but-not-applied — the same set the kill switch cancels.
+func (s *Service) ListByState(ctx context.Context, state State) ([]Record, error) {
+	return s.store.ListByState(ctx, state)
 }
 
 // HaltResponses cancels every pending (admitted-but-not-yet-applied) response action for the tenant,

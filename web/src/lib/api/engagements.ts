@@ -5,6 +5,7 @@ import type {
   UploadedSourcePackage,
 } from '../types'
 import { req } from './client'
+import type { EngagementWire, ScopeTargetWire } from './wire'
 
 function createRequest(input: CreateEngagementInput) {
   return {
@@ -19,25 +20,33 @@ function createRequest(input: CreateEngagementInput) {
   }
 }
 
-function mapEngagement(r: any): Engagement {
-  const targets = (xs: any[]): { kind: string; value: string }[] =>
-    (xs ?? []).map((t) => ({ kind: t.Kind ?? '', value: t.Value ?? '' }))
+// The wire shape is `engagementView` in internal/adapter/httpapi/resource_view.go: snake_case,
+// with the audit timestamps flattened onto the resource. See ./wire.ts.
+function mapEngagement(r: EngagementWire): Engagement {
+  const targets = (xs: ScopeTargetWire[] | undefined): ScopeTarget[] =>
+    (xs ?? []).map((t) => ({ kind: t?.kind ?? '', value: t?.value ?? '' }))
   return {
-    id: r.ID,
-    name: r.Name ?? '',
-    client: r.Client ?? '',
-    status: r.Status ?? '',
-    inScope: targets(r.Scope?.InScope),
-    outOfScope: targets(r.Scope?.OutOfScope),
-    authorizedFrom: r.AuthorizedFrom ?? null,
-    authorizedTo: r.AuthorizedTo ?? null,
+    id: r.id ?? '',
+    name: r.name ?? '',
+    client: r.client ?? '',
+    status: r.status ?? '',
+    inScope: targets(r.scope?.in_scope),
+    outOfScope: targets(r.scope?.out_of_scope),
+    authorizedFrom: r.authorized_from ?? null,
+    authorizedTo: r.authorized_to ?? null,
     roe: {
-      allowedToolClasses: r.RoE?.allowed_tool_classes ?? [],
-      blackouts: (r.RoE?.blackouts ?? []).map((b: any) => ({ from: b.from ?? '', to: b.to ?? '' })),
+      allowedToolClasses: r.roe?.allowed_tool_classes ?? [],
+      blackouts: (r.roe?.blackouts ?? []).map((b) => ({ from: b?.from ?? '', to: b?.to ?? '' })),
     },
-    liveReconEnabled: r.LiveReconEnabled ?? false,
-    createdAt: r.Audit?.CreatedAt ?? null,
-    businessAssetId: r.BusinessAssetID ?? '',
+    liveReconEnabled: r.live_recon_enabled ?? false,
+    offensiveRoe: {
+      customerContact: r.offensive_roe?.customer_contact ?? '',
+      emergencyContact: r.offensive_roe?.emergency_contact ?? '',
+      riskCeiling: r.offensive_roe?.risk_ceiling ?? '',
+      exclusionsChecked: r.offensive_roe?.exclusions_checked ?? false,
+    },
+    createdAt: r.created_at ?? null,
+    businessAssetId: r.business_asset_id ?? '',
     // Optional list-view enrichment; stays undefined when the API omits it.
     findingsCount: r.findings_count
       ? {
@@ -49,10 +58,19 @@ function mapEngagement(r: any): Engagement {
         }
       : undefined,
     lastScanDate: r.last_scan_date ?? undefined,
+    lastScanStatus: r.last_scan_status ?? undefined,
   }
 }
 
 export { mapEngagement }
+
+// A per-engagement tool credential. The secret value is write-only: it is sealed in the vault on set
+// and never returned, so this metadata carries only the name and timestamps.
+export interface EngagementCredential {
+  name: string
+  createdAt: string
+  updatedAt: string
+}
 
 export const engagementsApi = {
   listEngagements: async (): Promise<Engagement[]> =>
@@ -115,6 +133,27 @@ export const engagementsApi = {
       }),
     ),
 
+  setOffensiveRoE: async (
+    id: string,
+    roe: {
+      customerContact: string
+      emergencyContact: string
+      riskCeiling: string
+      exclusionsChecked: boolean
+    },
+  ): Promise<Engagement> =>
+    mapEngagement(
+      await req(`/engagements/${encodeURIComponent(id)}/offensive-roe`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          customer_contact: roe.customerContact,
+          emergency_contact: roe.emergencyContact,
+          risk_ceiling: roe.riskCeiling,
+          exclusions_checked: roe.exclusionsChecked,
+        }),
+      }),
+    ),
+
   transitionEngagement: async (id: string, status: string): Promise<Engagement> =>
     mapEngagement(
       await req(`/engagements/${encodeURIComponent(id)}`, {
@@ -134,6 +173,23 @@ export const engagementsApi = {
         body: JSON.stringify({ allowed_tool_classes: allowedToolClasses, blackouts }),
       }),
     ),
+
+  // Per-engagement tool credentials (vault-sealed placeholders resolved only at tool-execution time).
+  engagementCredentials: async (id: string): Promise<EngagementCredential[]> =>
+    ((await req(`/engagements/${encodeURIComponent(id)}/credentials`)) ?? []).map((c: any) => ({
+      name: c?.name ?? '',
+      createdAt: c?.created_at ?? '',
+      updatedAt: c?.updated_at ?? '',
+    })),
+  setEngagementCredential: async (id: string, name: string, value: string): Promise<void> => {
+    await req(`/engagements/${encodeURIComponent(id)}/credentials`, {
+      method: 'POST',
+      body: JSON.stringify({ name, value }),
+    })
+  },
+  deleteEngagementCredential: async (id: string, name: string): Promise<void> => {
+    await req(`/engagements/${encodeURIComponent(id)}/credentials/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  },
 
   importBundle: async (bundleJSON: string): Promise<Engagement> =>
     mapEngagement(await req('/engagements/import', { method: 'POST', body: bundleJSON })),

@@ -19,7 +19,7 @@ func TestMigration0073EmulationRuns(t *testing.T) {
 		t.Skip("set SYNAPSE_TEST_DB_DSN to run the postgres integration test")
 	}
 	ctx := context.Background()
-	if err := Migrate(ctx, dsn); err != nil {
+	if err := MigrateLocked(ctx, dsn); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	pool, err := Connect(ctx, dsn)
@@ -127,5 +127,13 @@ func TestMigration0073EmulationRuns(t *testing.T) {
 		VALUES ($1,$2,'emu.bad2','T0',true,'det.x','det.x',true)`, tenantA.String(), run.ID.String())
 	if !errors.As(ckErr2, &pgErr) || pgErr.Code != "23514" {
 		t.Fatalf("a matched detection recorded as a gap must fail a CHECK, got %v", ckErr2)
+	}
+
+	// The store derives the write tenant from the context and rejects a run that claims a different one,
+	// so a producer cannot write into another tenant's partition (defense in depth over RLS).
+	foreign := run
+	foreign.TenantID = shared.ID("tenant-foreign-0073")
+	if err := repo.SaveRun(ctx, foreign); !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("cross-tenant SaveRun = %v, want ErrForbidden", err)
 	}
 }

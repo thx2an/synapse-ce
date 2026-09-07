@@ -1,9 +1,13 @@
+# execution.mode selects the tool-execution placement (see values.yaml).
+execution:
+  mode: externalNative
 image:
   repository: registry.example.invalid/synapse
   digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 api:
   nodeSelector:
     synapse.example/runtime: control-plane
+    topology.kubernetes.io/region: us-east-1
   grantAuthority:
     enabled: true
     annotations:
@@ -26,6 +30,10 @@ web:
   image:
     repository: registry.example.invalid/synapse-web
     digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+egressBroker:
+  nodeSelector:
+    synapse.dev/execution-node: "true"
+    topology.kubernetes.io/region: us-east-1
 objectStore:
   endpoint: s3.example.internal:443
   bucket: synapse-evidence
