@@ -359,6 +359,10 @@ type Config struct {
 	LeaderRenew time.Duration
 	// WorkerConcurrency is the number of durable-queue claim loops in one synapse-worker process.
 	WorkerConcurrency int
+	// WorkerProfile narrows synapse-worker composition and queue claims. "all" keeps the
+	// hardened scanner worker; "integrations" runs only provider polling jobs and needs no
+	// executable-tool sandbox.
+	WorkerProfile WorkerProfile
 	// VulnerabilitySchedulerEnabled dispatches due vulnerability-source syncs and recovers stale
 	// runs. Postgres deployments must also enable fenced leader election to prevent duplicate work.
 	VulnerabilitySchedulerEnabled      bool
@@ -368,6 +372,16 @@ type Config struct {
 	VulnerabilitySchedulerDispatch     int
 	VulnerabilitySchedulerQueueDepth   int
 	VulnerabilitySchedulerRecovery     int
+	// IntegrationSchedulerEnabled dispatches polling operations for enabled external CI/CD
+	// integrations. The maintenance task is leader-gated by synapse-worker.
+	IntegrationSchedulerEnabled    bool
+	IntegrationSchedulerInterval   time.Duration
+	IntegrationSchedulerDispatch   int
+	IntegrationSchedulerQueueDepth int
+	// IntegrationAllowPrivateNetwork is an operator-controlled exception that permits
+	// tenant administrators to configure integrations targeting private address space.
+	// It is intentionally off by default because the API flag alone must not weaken SSRF controls.
+	IntegrationAllowPrivateNetwork bool
 	// Vulnerability rollout gates default off. Tenant-scoped mutations additionally require
 	// an explicit tenant allowlist entry; "*" enables all tenants. Dry-run records correlation
 	// differences without mutating occurrences, findings, actions, or notification outbox rows.
@@ -747,11 +761,6 @@ func Load() Config {
 		FleetCorrelationEnabled:                getbool("SYNAPSE_FLEET_CORRELATION_ENABLED", false),
 		FleetCorrelationWindow:                 getduration("SYNAPSE_FLEET_CORRELATION_WINDOW", 30*time.Minute),
 		FleetCorrelationMaxPerIncident:         getint("SYNAPSE_FLEET_CORRELATION_MAX_PER_INCIDENT", 100),
-		AlertWebhookURL:                        getenv("SYNAPSE_ALERT_WEBHOOK_URL", ""),
-		AlertWebhookSecret:                     getenv("SYNAPSE_ALERT_WEBHOOK_SECRET", ""),
-		AlertMinSeverity:                       getenv("SYNAPSE_ALERT_MIN_SEVERITY", "medium"),
-		AlertWebhookAllowPrivate:               getbool("SYNAPSE_ALERT_WEBHOOK_ALLOW_PRIVATE", false),
-		AlertWebhookAllowUnsigned:              getbool("SYNAPSE_ALERT_WEBHOOK_ALLOW_UNSIGNED", false),
 		JSReachabilityEnabled:                  getbool("SYNAPSE_JSREACH_ENABLED", false),
 		JSSymbolReachabilityEnabled:            getbool("SYNAPSE_JSREACH_TIER2_ENABLED", false),
 		RustReachabilityEnabled:                getbool("SYNAPSE_REACH_RUST", false),
@@ -788,6 +797,7 @@ func Load() Config {
 		LeaderTerm:                             getduration("SYNAPSE_LEADER_TERM", 15*time.Second),
 		LeaderRenew:                            getduration("SYNAPSE_LEADER_RENEW", 5*time.Second),
 		WorkerConcurrency:                      getint("SYNAPSE_WORKER_CONCURRENCY", defaultWorkerConcurrency),
+		WorkerProfile:                          WorkerProfile(normalizeEnv(getenv("SYNAPSE_WORKER_PROFILE", string(WorkerProfileAll)))),
 		VulnerabilitySchedulerEnabled:          getbool("SYNAPSE_VULNERABILITY_SCHEDULER_ENABLED", false),
 		VulnerabilitySchedulerPollInterval:     getduration("SYNAPSE_VULNERABILITY_SCHEDULER_POLL", time.Minute),
 		VulnerabilitySchedulerStaleAfter:       getduration("SYNAPSE_VULNERABILITY_SCHEDULER_STALE_AFTER", 30*time.Minute),
@@ -795,8 +805,12 @@ func Load() Config {
 		VulnerabilitySchedulerDispatch:         getint("SYNAPSE_VULNERABILITY_SCHEDULER_DISPATCH_LIMIT", 10),
 		VulnerabilitySchedulerQueueDepth:       getint("SYNAPSE_VULNERABILITY_SCHEDULER_MAX_QUEUE_DEPTH", 100),
 		VulnerabilitySchedulerRecovery:         getint("SYNAPSE_VULNERABILITY_SCHEDULER_RECOVERY_LIMIT", 10),
+		IntegrationSchedulerEnabled:            getbool("SYNAPSE_INTEGRATION_SCHEDULER_ENABLED", false),
+		IntegrationSchedulerInterval:           getduration("SYNAPSE_INTEGRATION_SCHEDULER_POLL", time.Minute),
+		IntegrationSchedulerDispatch:           getint("SYNAPSE_INTEGRATION_SCHEDULER_DISPATCH_LIMIT", 10),
+		IntegrationSchedulerQueueDepth:         getint("SYNAPSE_INTEGRATION_SCHEDULER_MAX_QUEUE_DEPTH", 100),
+		IntegrationAllowPrivateNetwork:         getbool("SYNAPSE_INTEGRATION_ALLOW_PRIVATE_NETWORK", false),
 		VulnerabilityProviderSyncEnabled:       getbool("SYNAPSE_VULNERABILITY_PROVIDER_SYNC_ENABLED", false),
-		VulnerabilitySourceAllowPrivateNetwork: getbool("SYNAPSE_VULNERABILITY_SOURCE_ALLOW_PRIVATE_NETWORK", false),
 		VulnerabilityOccurrenceWritesEnabled:   getbool("SYNAPSE_VULNERABILITY_OCCURRENCE_WRITES_ENABLED", false),
 		VulnerabilityFindingProjectionEnabled:  getbool("SYNAPSE_VULNERABILITY_FINDING_PROJECTION_ENABLED", false),
 		VulnerabilityActionsEnabled:            getbool("SYNAPSE_VULNERABILITY_ACTIONS_ENABLED", false),
@@ -854,6 +868,12 @@ func Load() Config {
 		FPTriageParseFailBaseBPS:               boundedNonNegative(getint("SYNAPSE_FP_TRIAGE_PARSE_FAILURE_BASELINE_BPS", 200), 10000),
 		FPTriageAlertDeltaBPS:                  boundedNonNegative(getint("SYNAPSE_FP_TRIAGE_ALERT_DEVIATION_BPS", 1000), 10000),
 		FPTriageIndependence:                   normalizeFPTriageIndependence(getenv("SYNAPSE_FP_TRIAGE_INDEPENDENCE", "model_family")),
+		AlertWebhookURL:                        getenv("SYNAPSE_ALERT_WEBHOOK_URL", ""),
+		AlertWebhookSecret:                     getenv("SYNAPSE_ALERT_WEBHOOK_SECRET", ""),
+		AlertMinSeverity:                       getenv("SYNAPSE_ALERT_MIN_SEVERITY", "medium"),
+		AlertWebhookAllowPrivate:               getbool("SYNAPSE_ALERT_WEBHOOK_ALLOW_PRIVATE", false),
+		AlertWebhookAllowUnsigned:              getbool("SYNAPSE_ALERT_WEBHOOK_ALLOW_UNSIGNED", false),
+		VulnerabilitySourceAllowPrivateNetwork: getbool("SYNAPSE_VULNERABILITY_SOURCE_ALLOW_PRIVATE_NETWORK", false),
 
 		AgentApprovalMode:    getenv("SYNAPSE_AGENT_APPROVAL_MODE", "manual"),
 		AgentApprovalTimeout: getduration("SYNAPSE_AGENT_APPROVAL_TIMEOUT", 30*time.Minute),
@@ -1031,6 +1051,33 @@ const (
 	ProcessRoleCLI    ProcessRole = "cli"
 )
 
+// WorkerProfile selects the smallest safe composition for a durable worker.
+type WorkerProfile string
+
+const (
+	WorkerProfileAll          WorkerProfile = "all"
+	WorkerProfileIntegrations WorkerProfile = "integrations"
+)
+
+func (c Config) ValidateWorkerProfile() error {
+	switch c.WorkerProfile {
+	case WorkerProfileAll, WorkerProfileIntegrations:
+		return nil
+	default:
+		return fmt.Errorf("SYNAPSE_WORKER_PROFILE must be %q or %q (got %q)", WorkerProfileAll, WorkerProfileIntegrations, c.WorkerProfile)
+	}
+}
+
+// ValidateWorkerSandboxPosture preserves the scanner worker's production fail-closed
+// sandbox gate while allowing the integration-only worker, which never constructs or
+// claims an executable-tool handler.
+func (c Config) ValidateWorkerSandboxPosture() error {
+	if c.WorkerProfile == WorkerProfileIntegrations {
+		return nil
+	}
+	return c.ValidateSandboxPosture()
+}
+
 // ResolveToolExecution decides how role may execute tools, failing closed on any
 // combination that would let a production API run an untrusted tool locally.
 //
@@ -1048,7 +1095,7 @@ func (c Config) ResolveToolExecution(role ProcessRole) (ToolExecution, error) {
 		if c.DBDSN == "" {
 			return "", errors.New("synapse-worker requires SYNAPSE_DB_DSN: queued execution cannot use process-local persistence")
 		}
-		if c.IsProduction() && !c.SandboxEnabled {
+		if c.IsProduction() && !c.SandboxEnabled && c.WorkerProfile != WorkerProfileIntegrations {
 			return "", errors.New("production synapse-worker requires SYNAPSE_SANDBOX_ENABLED=true")
 		}
 		return ToolExecutionWorker, nil

@@ -9,6 +9,10 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **Provider-neutral external CI/CD integrations.** Adds tenant-isolated, write-only encrypted Jenkins
+  credentials; bounded SSRF-resistant test, discovery, and polling operations; Project bindings and
+  exact-commit correlation; durable scheduled work; normalized run history; and an operator-controlled,
+  default-off exception for approved private Jenkins origins.
 - **Container CVEs can be traced to the Kubernetes workload that runs them.** A container vulnerability is found on an image digest, but operators need to know which workload it came from. A new **Workloads** view under Runtime Security (`GET /api/v1/fleet/workloads`) lists every Kubernetes workload mapped to the image digests it runs, from the cluster-inventory asset graph (`workload depends_on image`), grouped by namespace with the controller kind (Deployment / StatefulSet / DaemonSet). An image shared by several workloads is flagged on each, so a CVE on that digest is attributed to every deployment or statefulset that runs it. Empty until a cluster agent ingests a snapshot.
 
 - **Per-branch Code Quality analysis.** A Project's analysis history is now keyed by branch, not just

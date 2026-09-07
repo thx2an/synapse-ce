@@ -33,6 +33,7 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/domain/cloudposture"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/correlation"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/evidence"
+	integrationdom "github.com/KKloudTarus/synapse-ce/internal/domain/integration"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/judgment"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/offensivepolicy"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/riskassessment"
@@ -47,6 +48,7 @@ import (
 	egressinfra "github.com/KKloudTarus/synapse-ce/internal/infrastructure/egress"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/egressbroker"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/fleetca"
+	jenkinsintegration "github.com/KKloudTarus/synapse-ce/internal/infrastructure/integration/jenkins"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/llm/openai"
 	"github.com/KKloudTarus/synapse-ce/internal/infrastructure/logstream"
 	oidcadapter "github.com/KKloudTarus/synapse-ce/internal/infrastructure/oidc"
@@ -150,6 +152,7 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/fleetwork"
 	identitybff "github.com/KKloudTarus/synapse-ce/internal/usecase/identitybff"
 	identityuc "github.com/KKloudTarus/synapse-ce/internal/usecase/identityuc"
+	integrationuc "github.com/KKloudTarus/synapse-ce/internal/usecase/integrations"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/jsreach"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/leaderuc"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/llmverifier"
@@ -400,6 +403,8 @@ func main() {
 	var vulnerabilityActions ports.VulnerabilityActionStore
 	var vulnerabilityReconcileRuns ports.VulnerabilityReconcileRunStore
 	var vulnerabilityTransactions ports.TenantTransactionRunner
+	var integrationStore ports.IntegrationStore
+	var integrationMatcher ports.IntegrationAnalysisMatcher
 	var slaStore ports.SLAStore
 	var vulnerabilityWorker *worker.Worker
 	var reconRunLock ports.RunLocker              // recon run lease (Postgres only); row-lease, no pinned conn
@@ -585,6 +590,8 @@ func main() {
 		scmConnectorStore = scmRepo
 		reconQueue = postgres.NewJobQueue(pool, ids)
 		vulnerabilityQueue = reconQueue
+		postgresIntegrationStore := postgres.NewIntegrationStore(pool, vaultCipher)
+		integrationStore, integrationMatcher = postgresIntegrationStore, postgres.NewProjectAnalysisStore(pool)
 		vulnerabilitySourceStore = postgres.NewVulnerabilitySourceStore(pool)
 		vulnerabilityRunStore = postgres.NewSyncRunStore(pool, ids)
 		vulnerabilityMaterializer = postgres.NewAdvisoryMaterializer(pool)
@@ -686,6 +693,8 @@ func main() {
 		credVault = vault.NewMemoryVault(vaultCipher, nil)
 		scmConnectorStore = memory.NewSCMConnectorStore()
 		vulnerabilityQueue = memory.NewJobQueue(ids, clock.Now)
+		integrationStore = memory.NewIntegrationStore(vulnerabilityQueue, vaultCipher, clock, auditLog)
+		integrationMatcher = memory.MissingIntegrationAnalysisMatcher{}
 		vulnerabilitySourceStore = memory.NewVulnerabilitySourceStore()
 		vulnerabilityRunStore = memory.NewSyncRunStore(ids, clock.Now, vulnerabilityQueue)
 		vulnerabilityMaterializer = memory.NewAdvisoryMaterializer()
@@ -715,6 +724,20 @@ func main() {
 	// Use cases.
 	engService := enguc.NewService(repo, clock, ids, auditLog)
 	projectService := projectuc.NewService(projectRepo, repo, clock, ids, auditLog, !cfg.IsProduction())
+	integrationRegistry := integrationdom.NewRegistry()
+	if err := jenkinsintegration.Register(integrationRegistry); err != nil {
+		log.Error("integration provider registry init failed", "err", err)
+		os.Exit(1)
+	}
+	integrationService, err := integrationuc.NewService(integrationStore, integrationRegistry, projectRepo, integrationMatcher, ids, clock)
+	if err != nil {
+		log.Error("integration service init failed", "err", err)
+		os.Exit(1)
+	}
+	integrationService.SetPrivateNetworkAllowed(cfg.IntegrationAllowPrivateNetwork)
+	if cfg.DBDSN == "" {
+		integrationService.SetRunLock(memory.NewRunLock())
+	}
 	projectService.SetArchiveStore(file.NewProjectArchiveStore(cfg.ProjectUploadDir, cfg.MaxWorkspaceBytes))
 	projectService.SetAnalysisStore(projectAnalysisStore)
 	// A pipeline-imported analysis leaves a scan-job record, so the project's status and job history
@@ -1133,6 +1156,7 @@ func main() {
 		os.Exit(1)
 	}
 	router := httpapi.NewRouter(log, auth, engService, scaService, aupService, findingsService, exportService, reportService, evidenceService, reconService, logBroker, transferService, auditService, vexService, usersService, credentialsService)
+	router.SetIntegrations(integrationService)
 	if summaries, ok := findingRepo.(ports.FindingSummaryReader); ok {
 		router.SetFindingSummaries(summaries)
 	}
@@ -1274,6 +1298,7 @@ func main() {
 		metrics = observability.New(queueReader, postgres.NewPoolStatsSource(databasePool))
 		httpObserver = metrics
 		scaService.SetObserver(metrics)
+		integrationService.SetObserver(metrics)
 		if !metricsAddrIsLoopback(cfg.MetricsAddr) {
 			log.Warn("metrics listener is bound to a non-loopback address; it is unauthenticated and exposes aggregate operational metrics to anything that can reach it", "addr", cfg.MetricsAddr)
 		}
@@ -1421,6 +1446,7 @@ func main() {
 		vulnerabilityWorker = worker.New(vulnerabilityQueue, map[string]worker.Handler{
 			vulnerabilitymonitor.JobKind:   vulnerabilitySyncJobHandler{svc: vulnerabilityMonitor},
 			vulnerabilityreconcile.JobKind: vulnerabilityReconcileJobHandler{svc: vulnerabilityReconciliation},
+			integrationuc.JobKind:          integrationJobHandler{svc: integrationService},
 		}, worker.Config{Visibility: 2 * time.Minute, Poll: 100 * time.Millisecond, MaxAttempts: 3}, log)
 	}
 	router.SetAITriageReviews(aiTriageReviewService)
@@ -2785,6 +2811,16 @@ type vulnerabilitySyncJobHandler struct{ svc *vulnerabilitymonitor.Service }
 
 type vulnerabilityReconcileJobHandler struct {
 	svc *vulnerabilityreconciliation.Service
+}
+
+type integrationJobHandler struct{ svc *integrationuc.Service }
+
+func (handler integrationJobHandler) Handle(ctx context.Context, job ports.QueuedJob) error {
+	return handler.svc.HandleJob(ctx, job.ID, job.Payload)
+}
+
+func (handler integrationJobHandler) OnDeadLetter(ctx context.Context, job ports.QueuedJob, _ error) error {
+	return handler.svc.OnDeadLetter(ctx, job.Payload)
 }
 
 func (h vulnerabilityReconcileJobHandler) Handle(ctx context.Context, job ports.QueuedJob) error {
