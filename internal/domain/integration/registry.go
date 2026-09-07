@@ -39,6 +39,8 @@ type Adapter interface {
 type Factory func(Integration, CredentialBundle) (Adapter, error)
 
 type ProviderError struct {
+	// Err must contain a bounded, credential-free diagnostic suitable for an
+	// integration operation history entry. Provider adapters are code-owned.
 	Retryable bool
 	Err       error
 }

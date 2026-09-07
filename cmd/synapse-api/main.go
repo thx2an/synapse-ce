@@ -556,7 +556,7 @@ func main() {
 		reconQueue = postgres.NewJobQueue(pool, ids)
 		vulnerabilityQueue = reconQueue
 		postgresIntegrationStore := postgres.NewIntegrationStore(pool, vaultCipher)
-		integrationStore, integrationMatcher = postgresIntegrationStore, postgresIntegrationStore
+		integrationStore, integrationMatcher = postgresIntegrationStore, postgres.NewProjectAnalysisStore(pool)
 		vulnerabilitySourceStore = postgres.NewVulnerabilitySourceStore(pool)
 		vulnerabilityRunStore = postgres.NewSyncRunStore(pool, ids)
 		vulnerabilityMaterializer = postgres.NewAdvisoryMaterializer(pool)
@@ -693,6 +693,7 @@ func main() {
 		log.Error("integration service init failed", "err", err)
 		os.Exit(1)
 	}
+	integrationService.SetPrivateNetworkAllowed(cfg.IntegrationAllowPrivateNetwork)
 	if cfg.DBDSN == "" {
 		integrationService.SetRunLock(memory.NewRunLock())
 	}

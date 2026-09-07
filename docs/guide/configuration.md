@@ -254,6 +254,7 @@ All off by default. The fleet needs PostgreSQL + `synapse-worker`; agents run on
 | `SYNAPSE_INTEGRATION_SCHEDULER_POLL` | `1m` | Interval for checking enabled integrations whose provider poll is due. |
 | `SYNAPSE_INTEGRATION_SCHEDULER_DISPATCH_LIMIT` | `10` | Maximum integration poll operations created per scheduler tick. |
 | `SYNAPSE_INTEGRATION_SCHEDULER_MAX_QUEUE_DEPTH` | `100` | Stop integration dispatch when the durable queue reaches this aggregate depth. |
+| `SYNAPSE_INTEGRATION_ALLOW_PRIVATE_NETWORK` | `false` | Operator gate allowing tenant administrators to request private-address Jenkins origins. Keep off unless internal egress is explicitly approved; loopback, link-local, metadata, CGNAT, 6to4, and well-known NAT64 ranges remain blocked. |
 | `SYNAPSE_VULNERABILITY_SCHEDULER_ENABLED` | `false` | Dispatch due vulnerability-source syncs and recover stale runs. PostgreSQL deployments must also enable leader election. |
 | `SYNAPSE_VULNERABILITY_SCHEDULER_POLL` | `1m` | Scheduler polling interval. |
 | `SYNAPSE_VULNERABILITY_SCHEDULER_STALE_AFTER` | `30m` | Age after which a queued/running sync is eligible for checkpoint-based recovery. |

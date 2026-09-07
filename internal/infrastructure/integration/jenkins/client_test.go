@@ -130,6 +130,12 @@ func TestJenkinsRequestsRejectTraversalCrossOriginAndOversizedResponses(t *testi
 	if _, err := adapter.externalKey("https://attacker.example/job/a/"); err == nil {
 		t.Fatal("cross-origin Jenkins job URL accepted")
 	}
+	if key, err := adapter.externalKey("https://jenkins.example.com:443/jenkins/job/v1..v2/"); err != nil || key != "/job/v1..v2" {
+		t.Fatalf("default-port or benign double-dot job key=%q err=%v", key, err)
+	}
+	if _, err := adapter.externalKey("https://jenkins.example.com:443/jenkins/pipeline/a/"); err == nil {
+		t.Fatal("non-Jenkins pipeline key accepted")
+	}
 	var output any
 	if err := adapter.get(context.Background(), "/api/json", nil, &output); err == nil || integration.IsRetryable(err) {
 		t.Fatalf("oversized response error = %v, want permanent", err)
@@ -139,7 +145,6 @@ func TestJenkinsRequestsRejectTraversalCrossOriginAndOversizedResponses(t *testi
 func TestJenkinsRejectsCredentialReflectionInProviderControlledFields(t *testing.T) {
 	for _, body := range []string{
 		`{"jobs":[{"name":"release-token","url":"https://jenkins.example.com/jenkins/job/release/","_class":"hudson.model.FreeStyleProject"}]}`,
-		`{"jobs":[{"name":"release","url":"https://jenkins.example.com/jenkins/job/reader/","_class":"hudson.model.FreeStyleProject"}]}`,
 	} {
 		adapter := testAdapter(t, roundTripFunc(func(*http.Request) (*http.Response, error) { return jsonResponse(body), nil }))
 		if _, _, err := adapter.DiscoverPipelines(context.Background(), ""); err == nil || integration.IsRetryable(err) {
@@ -153,6 +158,12 @@ func TestJenkinsRejectsCredentialReflectionInProviderControlledFields(t *testing
 	}
 	if _, err := adapter.safeRunURL("https://jenkins.example.com/jenkins/job/release/%74%6f%6b%65%6e/", "/job/release/1"); err == nil {
 		t.Fatal("percent-encoded credential-bearing build URL was accepted")
+	}
+	if _, err := adapter.safeRunURL("https://jenkins.example.com/jenkins/job/release/%2574%256f%256b%2565%256e/", "/job/release/1"); err == nil {
+		t.Fatal("double-percent-encoded credential-bearing build URL was accepted")
+	}
+	if _, err := adapter.safeRunURL("https://jenkins.example.com/jenkins/job/reader/1/", "/job/reader/1"); err != nil {
+		t.Fatalf("benign username substring rejected: %v", err)
 	}
 }
 
@@ -171,5 +182,34 @@ func TestJenkinsRequestsConsumeAggregateOperationBudget(t *testing.T) {
 	byteLimited := integration.WithOperationBudget(context.Background(), 1, 1)
 	if err := adapter.get(byteLimited, "/api/json", nil, &output); !errors.Is(err, integration.ErrOperationBudgetExceeded) {
 		t.Fatalf("response byte error=%v, want operation budget exceeded", err)
+	}
+}
+
+func TestJenkinsDiscoveryHonorsAggregateOperationBudget(t *testing.T) {
+	adapter := testAdapter(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(`{"jobs":[{"name":"folder","url":"https://jenkins.example.com/jenkins/job/folder/","_class":"com.cloudbees.hudson.plugins.folder.Folder"}]}`), nil
+	}))
+	ctx := integration.WithOperationBudget(context.Background(), 1, 1<<20)
+	if _, _, err := adapter.DiscoverPipelines(ctx, ""); !errors.Is(err, integration.ErrOperationBudgetExceeded) {
+		t.Fatalf("discovery budget error=%v, want operation budget exceeded", err)
+	}
+}
+
+func TestJenkinsReadsQueueOnceAcrossBindingsInOneOperation(t *testing.T) {
+	queueCalls := 0
+	adapter := testAdapter(t, roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/jenkins/queue/api/json" {
+			queueCalls++
+			return jsonResponse(`{"items":[]}`), nil
+		}
+		return jsonResponse(`{"builds":[]}`), nil
+	}))
+	for _, key := range []string{"/job/alpha", "/job/beta"} {
+		if _, _, err := adapter.ReadRuns(context.Background(), integration.Binding{ExternalKey: key}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if queueCalls != 1 {
+		t.Fatalf("queue endpoint calls=%d, want 1", queueCalls)
 	}
 }

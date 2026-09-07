@@ -91,6 +91,9 @@ func TestSchedulerIsLeaderGatedBackpressureAwareAndDispatchBounded(t *testing.T)
 	if dispatched, err := scheduler.Tick(ctx); err != nil || dispatched != 1 {
 		t.Fatalf("leader dispatched=%d err=%v", dispatched, err)
 	}
+	if len(audit.entries) != 2 {
+		t.Fatalf("scheduler poll flooded audit log: entries=%+v", audit.entries)
+	}
 	if depth, err := queue.Depth(ctx, JobKind); err != nil || depth != 1 {
 		t.Fatalf("queue depth=%d err=%v", depth, err)
 	}

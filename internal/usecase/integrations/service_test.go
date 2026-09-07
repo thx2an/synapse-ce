@@ -29,9 +29,12 @@ func (audit *integrationTestAudit) Record(_ context.Context, entry ports.AuditEn
 	return nil
 }
 
-type integrationTestMatcher struct{}
+type integrationTestMatcher struct{ err error }
 
-func (integrationTestMatcher) MatchIntegrationAnalysis(_ context.Context, _ shared.ID, revision string) (shared.ID, integration.CorrelationState, error) {
+func (matcher integrationTestMatcher) MatchIntegrationAnalysis(_ context.Context, _ shared.ID, revision string) (shared.ID, integration.CorrelationState, error) {
+	if matcher.err != nil {
+		return "", "", matcher.err
+	}
 	if revision == "abc123" {
 		return "analysis-1", integration.CorrelationLinked, nil
 	}
@@ -103,6 +106,38 @@ func (lock *integrationTestLeaseLock) TryLockLeased(ctx context.Context, _ strin
 func (lock *integrationTestLeaseLock) Cancel() {
 	if lock.cancel != nil {
 		lock.cancel()
+	}
+}
+
+func TestPrivateNetworkIntegrationsRequireOperatorApproval(t *testing.T) {
+	ctx := context.Background()
+	clock := &integrationTestClock{now: time.Date(2026, 8, 31, 8, 0, 0, 0, time.UTC)}
+	ids := idgen.RandomID{}
+	queue := memory.NewJobQueue(ids, clock.Now)
+	cipher, err := vault.NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := memory.NewIntegrationStore(queue, cipher, clock, &integrationTestAudit{})
+	registry := integration.NewRegistry()
+	descriptor := integration.ProviderDescriptor{Provider: "fake-ci", Name: "Fake CI"}
+	if err := registry.Register(descriptor, func(integration.Integration, integration.CredentialBundle) (integration.Adapter, error) {
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(store, registry, memory.NewProjectRepository(), integrationTestMatcher{}, ids, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := CreateInput{TenantID: "tenant-1", Provider: "fake-ci", Name: "Private CI", Endpoint: "https://ci.internal", Config: map[string]any{}, AllowPrivateNetwork: true, PollInterval: time.Minute, Actor: "admin"}
+	if _, err := service.Create(ctx, input); !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("private integration without operator gate error=%v", err)
+	}
+	service.SetPrivateNetworkAllowed(true)
+	created, err := service.Create(ctx, input)
+	if err != nil || !created.AllowPrivateNetwork {
+		t.Fatalf("approved private integration=%+v err=%v", created, err)
 	}
 }
 
@@ -265,6 +300,17 @@ func TestServiceFullMemoryWorkflowIsIdempotentAndCancellationSafe(t *testing.T) 
 	if err != nil || binding.ProjectID != projectItem.ID {
 		t.Fatalf("binding = %+v, err=%v", binding, err)
 	}
+	service.matcher = integrationTestMatcher{err: context.DeadlineExceeded}
+	matcherTimeout, err := service.StartOperation(ctx, tenantID, created.ID, integration.OperationPoll, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executeNextIntegrationJob(t, ctx, tenantID, queue, service)
+	matcherTimeout, err = service.GetOperation(ctx, tenantID, matcherTimeout.ID)
+	if err != nil || matcherTimeout.State != integration.OperationFailed || len(matcherTimeout.Errors) != 1 || matcherTimeout.Errors[0] != "integration operation deadline exceeded" {
+		t.Fatalf("matcher deadline operation=%+v err=%v", matcherTimeout, err)
+	}
+	service.matcher = integrationTestMatcher{}
 
 	for range 2 {
 		clock.advance()
@@ -304,7 +350,7 @@ func TestServiceFullMemoryWorkflowIsIdempotentAndCancellationSafe(t *testing.T) 
 	}
 	executeNextIntegrationJob(t, ctx, tenantID, queue, service)
 	boundedOperation, err = service.GetOperation(ctx, tenantID, boundedOperation.ID)
-	if err != nil || boundedOperation.State != integration.OperationFailed {
+	if err != nil || boundedOperation.State != integration.OperationFailed || len(boundedOperation.Errors) != 1 || boundedOperation.Errors[0] != "integration poll exceeds 200 runs" {
 		t.Fatalf("aggregate run budget operation = %+v, err=%v", boundedOperation, err)
 	}
 	boundedRuns, err := service.ListExternalRuns(ctx, tenantID, created.ID, 500)
@@ -326,6 +372,33 @@ func TestServiceFullMemoryWorkflowIsIdempotentAndCancellationSafe(t *testing.T) 
 	runs, err = service.ListExternalRuns(ctx, tenantID, created.ID, 100)
 	if err != nil || len(runs) != 2 {
 		t.Fatalf("partial poll discarded last-known-good runs = %+v, err=%v", runs, err)
+	}
+	clock.advance()
+	disabledPoll, err := service.StartOperation(ctx, tenantID, created.ID, integration.OperationPoll, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledJob, err := queue.Claim(ctx, time.Minute, JobKind)
+	if err != nil || disabledJob == nil {
+		t.Fatalf("claim disable-fence job=%+v err=%v", disabledJob, err)
+	}
+	if _, execute, beginErr := store.BeginIntegrationOperation(shared.WithTenant(ctx, tenantID), disabledPoll.ID, clock.Now()); beginErr != nil || !execute {
+		t.Fatalf("begin disable-fence poll: execute=%v err=%v", execute, beginErr)
+	}
+	disabled, err := service.SetEnabled(ctx, tenantID, created.ID, false, enabled.Version, "admin")
+	if err != nil || disabled.Enabled {
+		t.Fatalf("disable integration=%+v err=%v", disabled, err)
+	}
+	disabledPoll, err = service.GetOperation(ctx, tenantID, disabledPoll.ID)
+	if err != nil || disabledPoll.State != integration.OperationCancelled {
+		t.Fatalf("disable did not cancel active poll=%+v err=%v", disabledPoll, err)
+	}
+	if _, err := store.FinishIntegrationPoll(shared.WithTenant(ctx, tenantID), disabledPoll.ID, integration.OperationSucceeded, "late", integration.OperationCounts{}, nil, nil, clock.Now()); !errors.Is(err, shared.ErrConflict) {
+		t.Fatalf("disabled poll publication error=%v, want conflict", err)
+	}
+	enabled, err = service.SetEnabled(ctx, tenantID, created.ID, true, disabled.Version, "admin")
+	if err != nil || !enabled.Enabled {
+		t.Fatalf("re-enable integration=%+v err=%v", enabled, err)
 	}
 	clock.advance()
 	fencedPoll, err := service.StartOperation(ctx, tenantID, created.ID, integration.OperationPoll, "admin")

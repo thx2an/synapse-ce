@@ -102,6 +102,10 @@ func (rt *Router) updateIntegration(w http.ResponseWriter, r *http.Request) {
 	if !decodeIntegrationJSON(w, r, &body) {
 		return
 	}
+	if body.Version < 1 {
+		writeError(w, rt.log, fmt.Errorf("%w: version must be at least 1", shared.ErrValidation))
+		return
+	}
 	item, err := rt.integrations.Update(r.Context(), shared.ID(TenantFrom(r.Context())), shared.ID(r.PathValue("id")), integrationuc.UpdateInput{
 		Name: body.Name, Endpoint: body.Endpoint, Config: body.Config, AllowPrivateNetwork: body.AllowPrivateNetwork,
 		PollInterval: time.Duration(body.PollIntervalSeconds) * time.Second, Version: body.Version, Actor: PrincipalFrom(r.Context()),
@@ -128,6 +132,10 @@ func (rt *Router) setIntegrationEnabled(w http.ResponseWriter, r *http.Request, 
 	if !decodeIntegrationJSON(w, r, &body) {
 		return
 	}
+	if body.Version < 1 {
+		writeError(w, rt.log, fmt.Errorf("%w: version must be at least 1", shared.ErrValidation))
+		return
+	}
 	item, err := rt.integrations.SetEnabled(r.Context(), shared.ID(TenantFrom(r.Context())), shared.ID(r.PathValue("id")), enabled, body.Version, PrincipalFrom(r.Context()))
 	if err != nil {
 		writeError(w, rt.log, err)
@@ -141,6 +149,10 @@ func (rt *Router) archiveIntegration(w http.ResponseWriter, r *http.Request) {
 		Version int `json:"version"`
 	}
 	if !decodeIntegrationJSON(w, r, &body) {
+		return
+	}
+	if body.Version < 1 {
+		writeError(w, rt.log, fmt.Errorf("%w: version must be at least 1", shared.ErrValidation))
 		return
 	}
 	if err := rt.integrations.Archive(r.Context(), shared.ID(TenantFrom(r.Context())), shared.ID(r.PathValue("id")), body.Version, PrincipalFrom(r.Context())); err != nil {
@@ -159,6 +171,10 @@ func (rt *Router) putIntegrationCredential(w http.ResponseWriter, r *http.Reques
 	if !decodeIntegrationJSON(w, r, &body) {
 		return
 	}
+	if body.Version < 1 || body.ConnectionRevision < 1 {
+		writeError(w, rt.log, fmt.Errorf("%w: version and connection_revision must be at least 1", shared.ErrValidation))
+		return
+	}
 	if err := rt.integrations.SetCredential(r.Context(), shared.ID(TenantFrom(r.Context())), shared.ID(r.PathValue("id")), body.Secrets, body.Version, body.ConnectionRevision, PrincipalFrom(r.Context())); err != nil {
 		writeError(w, rt.log, err)
 		return
@@ -172,6 +188,10 @@ func (rt *Router) deleteIntegrationCredential(w http.ResponseWriter, r *http.Req
 		ConnectionRevision int `json:"connection_revision"`
 	}
 	if !decodeIntegrationJSON(w, r, &body) {
+		return
+	}
+	if body.Version < 1 || body.ConnectionRevision < 1 {
+		writeError(w, rt.log, fmt.Errorf("%w: version and connection_revision must be at least 1", shared.ErrValidation))
 		return
 	}
 	if err := rt.integrations.DeleteCredential(r.Context(), shared.ID(TenantFrom(r.Context())), shared.ID(r.PathValue("id")), body.Version, body.ConnectionRevision, PrincipalFrom(r.Context())); err != nil {

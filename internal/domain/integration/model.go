@@ -327,10 +327,15 @@ func (pipeline *Pipeline) Normalize() error {
 func CanonicalExternalKey(raw string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("%w: external pipeline key must be a relative job path", shared.ErrValidation)
+		return "", fmt.Errorf("%w: external pipeline key must be a relative path", shared.ErrValidation)
+	}
+	for _, segment := range strings.Split(parsed.Path, "/") {
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("%w: external pipeline key contains path traversal", shared.ErrValidation)
+		}
 	}
 	cleaned := path.Clean("/" + strings.TrimPrefix(parsed.Path, "/"))
-	if cleaned == "/" || !strings.HasPrefix(cleaned, "/job/") || strings.Contains(cleaned, "..") || len(cleaned) > 1024 {
+	if cleaned == "/" || len(cleaned) > 1024 {
 		return "", fmt.Errorf("%w: external pipeline key is invalid", shared.ErrValidation)
 	}
 	return strings.TrimSuffix(cleaned, "/"), nil

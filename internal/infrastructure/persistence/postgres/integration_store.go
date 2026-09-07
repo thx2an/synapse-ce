@@ -28,7 +28,6 @@ func NewIntegrationStore(pool *pgxpool.Pool, cipher *vault.Cipher) *IntegrationS
 }
 
 var _ ports.IntegrationStore = (*IntegrationStore)(nil)
-var _ ports.IntegrationAnalysisMatcher = (*IntegrationStore)(nil)
 
 func (store *IntegrationStore) CreateIntegration(ctx context.Context, item integration.Integration, audit ports.AuditEntry) error {
 	if err := item.Normalize(); err != nil {
@@ -99,7 +98,11 @@ func (store *IntegrationStore) UpdateIntegration(ctx context.Context, item integ
 		if current.Archived || current.Version != expectedVersion {
 			return shared.ErrConflict
 		}
-		material := current.Endpoint != item.Endpoint || string(current.Config) != string(item.Config) || current.AllowPrivateNetwork != item.AllowPrivateNetwork
+		var configChanged bool
+		if err := tx.QueryRow(ctx, `SELECT config IS DISTINCT FROM $2::jsonb FROM integrations WHERE id=$1`, item.ID.String(), item.Config).Scan(&configChanged); err != nil {
+			return fmt.Errorf("compare integration configuration: %w", err)
+		}
+		material := current.Endpoint != item.Endpoint || configChanged || current.AllowPrivateNetwork != item.AllowPrivateNetwork
 		originChanged := current.Endpoint != item.Endpoint
 		enabled, connectionRevision, credentialRevision := current.Enabled, current.ConnectionRevision, current.CredentialRevision
 		if material {
@@ -138,6 +141,30 @@ func (store *IntegrationStore) UpdateIntegration(ctx context.Context, item integ
 
 func (store *IntegrationStore) SetIntegrationEnabled(ctx context.Context, id shared.ID, enabled bool, expectedVersion int, audit ports.AuditEntry) (updated integration.Integration, err error) {
 	err = WithContextTenant(ctx, store.pool, func(tx pgx.Tx) error {
+		if !enabled {
+			current, loadErr := scanIntegration(tx.QueryRow(ctx, integrationSelect+` WHERE id=$1 FOR UPDATE`, id.String()))
+			if errors.Is(loadErr, pgx.ErrNoRows) {
+				return shared.ErrNotFound
+			}
+			if loadErr != nil {
+				return fmt.Errorf("lock integration for disable: %w", loadErr)
+			}
+			if current.Archived || current.Version != expectedVersion {
+				return shared.ErrConflict
+			}
+			if err := invalidateIntegrationOperations(ctx, tx, id, time.Now().UTC()); err != nil {
+				return err
+			}
+			if _, updateErr := tx.Exec(ctx, `UPDATE integrations SET enabled=FALSE,version=version+1,updated_at=now() WHERE id=$1`, id.String()); updateErr != nil {
+				return fmt.Errorf("disable integration: %w", updateErr)
+			}
+			var scanErr error
+			updated, scanErr = scanIntegration(tx.QueryRow(ctx, integrationSelect+` WHERE id=$1`, id.String()))
+			if scanErr != nil {
+				return scanErr
+			}
+			return appendTenantAudit(ctx, tx, updated.TenantID.String(), audit)
+		}
 		tag, updateErr := tx.Exec(ctx, `UPDATE integrations AS target SET enabled=$2,version=version+1,updated_at=now()
 			WHERE target.id=$1 AND target.version=$3 AND target.archived=FALSE AND (NOT $2 OR (
 				EXISTS(SELECT 1 FROM integration_credentials credential WHERE credential.integration_id=target.id AND credential.credential_id='default')
@@ -298,13 +325,20 @@ func (store *IntegrationStore) CreateIntegrationBinding(ctx context.Context, bin
 	}
 	return WithContextTenant(ctx, store.pool, func(tx pgx.Tx) error {
 		var archived bool
-		if err := tx.QueryRow(ctx, `SELECT archived FROM integrations WHERE id=$1 FOR SHARE`, binding.IntegrationID.String()).Scan(&archived); errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT archived FROM integrations WHERE id=$1 FOR UPDATE`, binding.IntegrationID.String()).Scan(&archived); errors.Is(err, pgx.ErrNoRows) {
 			return shared.ErrNotFound
 		} else if err != nil {
 			return fmt.Errorf("lock integration for binding creation: %w", err)
 		}
 		if archived {
 			return shared.ErrConflict
+		}
+		var bindingCount int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM integration_bindings WHERE integration_id=$1`, binding.IntegrationID.String()).Scan(&bindingCount); err != nil {
+			return fmt.Errorf("count integration bindings: %w", err)
+		}
+		if bindingCount >= integration.MaxBindingsPerPoll {
+			return fmt.Errorf("%w: an integration supports at most %d bindings", shared.ErrValidation, integration.MaxBindingsPerPoll)
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO integration_bindings(id,tenant_id,integration_id,project_id,external_key,external_name,version,created_at,updated_at)
 			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, binding.ID.String(), binding.TenantID.String(), binding.IntegrationID.String(), binding.ProjectID.String(), binding.ExternalKey, binding.ExternalName, binding.Version, binding.CreatedAt.UTC(), binding.UpdatedAt.UTC())
@@ -383,6 +417,9 @@ func (store *IntegrationStore) StartIntegrationOperation(ctx context.Context, op
 		}
 		if err != nil {
 			return fmt.Errorf("create integration operation: %w", err)
+		}
+		if strings.TrimSpace(audit.Action) == "" {
+			return nil
 		}
 		return appendTenantAudit(ctx, tx, operation.TenantID.String(), audit)
 	})
@@ -564,7 +601,7 @@ func (store *IntegrationStore) ListDueIntegrations(ctx context.Context, now time
 		rows, queryErr := tx.Query(ctx, integrationSelect+` WHERE enabled=TRUE AND archived=FALSE
 			AND NOT EXISTS(SELECT 1 FROM integration_operations active WHERE active.integration_id=integrations.id AND active.state IN ('queued','running'))
 			AND COALESCE((SELECT max(done.updated_at) FROM integration_operations done WHERE done.integration_id=integrations.id AND done.operation_type='poll' AND done.state IN ('succeeded','partial','failed','cancelled')), '-infinity'::timestamptz)
-				<= $1 - make_interval(secs=>poll_interval_seconds)
+				<= $1::timestamptz - make_interval(secs=>poll_interval_seconds)
 			ORDER BY updated_at,id COLLATE "C" LIMIT $2`, now.UTC(), limit)
 		if queryErr != nil {
 			return fmt.Errorf("list due integrations: %w", queryErr)
@@ -614,43 +651,6 @@ func (store *IntegrationStore) ListIntegrationExternalRuns(ctx context.Context, 
 		return rows.Err()
 	})
 	return runs, err
-}
-
-func (store *IntegrationStore) MatchIntegrationAnalysis(ctx context.Context, projectID shared.ID, revision string) (analysisID shared.ID, state integration.CorrelationState, err error) {
-	tenantID, ok := shared.TenantFrom(ctx)
-	revision = strings.TrimSpace(revision)
-	if !ok || projectID.IsZero() || revision == "" {
-		return "", integration.CorrelationMissing, nil
-	}
-	var matches []shared.ID
-	err = WithContextTenant(ctx, store.pool, func(tx pgx.Tx) error {
-		rows, queryErr := tx.Query(ctx, `SELECT id FROM project_analyses WHERE tenant_id=$1 AND project_id=$2
-			AND ((payload->>'source_commit')=$3 OR (payload#>>'{source_revision,head}')=$3)
-			ORDER BY created_at DESC,id COLLATE "C" DESC LIMIT 2`, tenantID.String(), projectID.String(), revision)
-		if queryErr != nil {
-			return fmt.Errorf("match integration analysis: %w", queryErr)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id shared.ID
-			if scanErr := rows.Scan(&id); scanErr != nil {
-				return scanErr
-			}
-			matches = append(matches, id)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return "", "", err
-	}
-	switch len(matches) {
-	case 0:
-		return "", integration.CorrelationMissing, nil
-	case 1:
-		return matches[0], integration.CorrelationLinked, nil
-	default:
-		return "", integration.CorrelationAmbiguous, nil
-	}
 }
 
 const integrationSelect = `SELECT id,tenant_id,provider,display_name,endpoint,config,allow_private_network,poll_interval_seconds,enabled,archived,version,connection_revision,credential_revision,created_at,updated_at FROM integrations`

@@ -651,6 +651,11 @@ type VulnerabilityReconciliationTenantStore interface {
 	ListTenantIDs(ctx context.Context) ([]shared.ID, error)
 }
 
+// TenantLister enumerates tenant scopes for provider-neutral background work.
+type TenantLister interface {
+	ListTenantIDs(ctx context.Context) ([]shared.ID, error)
+}
+
 type ReconciliationEngagementPage struct {
 	IDs  []shared.ID
 	Next shared.ID

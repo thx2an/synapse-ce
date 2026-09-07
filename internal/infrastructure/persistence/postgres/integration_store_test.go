@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -29,6 +30,33 @@ func integrationMutationAudit(action string, target shared.ID, at time.Time) por
 	return ports.AuditEntry{Actor: "admin", Action: action, Target: target.String(), At: at}
 }
 
+func isolatedIntegrationDatabase(t *testing.T, ctx context.Context, sharedDSN string) string {
+	t.Helper()
+	adminConfig, err := pgx.ParseConfig(sharedDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := pgx.ConnectConfig(ctx, adminConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databaseName := fmt.Sprintf("synapse_integration_%s", randHex(t))
+	quotedDatabase := pgx.Identifier{databaseName}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+quotedDatabase); err != nil {
+		admin.Close(ctx)
+		t.Fatalf("create isolated integration database: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup := context.Background()
+		_, _ = admin.Exec(cleanup, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`, databaseName)
+		_, _ = admin.Exec(cleanup, "DROP DATABASE IF EXISTS "+quotedDatabase)
+		_ = admin.Close(cleanup)
+	})
+	isolationConfig := adminConfig.Copy()
+	isolationConfig.Database = databaseName
+	return isolationConfig.ConnString()
+}
+
 func TestMigration0130DefinesBoundedProviderNeutralRLSSchema(t *testing.T) {
 	contents, err := migrations.FS.ReadFile("0130_integration_framework.sql")
 	if err != nil {
@@ -40,7 +68,7 @@ func TestMigration0130DefinesBoundedProviderNeutralRLSSchema(t *testing.T) {
 			t.Errorf("migration missing table/RLS for %s", table)
 		}
 	}
-	for _, invariant := range []string{"integration_operations_one_active_idx", "octet_length(config::text) <= 32768", "UNIQUE (tenant_id, integration_id, provider_key)", "FOREIGN KEY (tenant_id, project_id)"} {
+	for _, invariant := range []string{"integration_operations_one_active_idx", "octet_length(config::text) <= 32768", "UNIQUE (tenant_id, integration_id, provider_key)", "FOREIGN KEY (tenant_id, project_id)", "FOREIGN KEY (tenant_id, analysis_id)", "project_analyses_tenant_id_id_unique"} {
 		if !strings.Contains(sql, invariant) {
 			t.Errorf("migration missing invariant %q", invariant)
 		}
@@ -56,6 +84,7 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 		t.Skip("set SYNAPSE_TEST_DB_DSN to run the postgres integration test")
 	}
 	ctx := context.Background()
+	dsn = isolatedIntegrationDatabase(t, ctx, dsn)
 	if err := Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
@@ -79,27 +108,13 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	t.Cleanup(func() {
-		cleanup := context.Background()
-		for _, query := range []string{
-			`DELETE FROM integration_external_runs WHERE tenant_id IN ($1,$2)`, `DELETE FROM integration_operations WHERE tenant_id IN ($1,$2)`,
-			`DELETE FROM jobs WHERE tenant_id IN ($1,$2)`, `DELETE FROM integration_bindings WHERE tenant_id IN ($1,$2)`,
-			`DELETE FROM integration_credentials WHERE tenant_id IN ($1,$2)`, `DELETE FROM integrations WHERE tenant_id IN ($1,$2)`,
-			`DELETE FROM project_analyses WHERE tenant_id IN ($1,$2)`, `DELETE FROM projects WHERE tenant_id IN ($1,$2)`, `DELETE FROM tenants WHERE id IN ($1,$2)`,
-		} {
-			if _, err := pool.Exec(cleanup, query, tenantA.String(), tenantB.String()); err != nil {
-				t.Errorf("cleanup %q: %v", query, err)
-			}
-		}
-	})
-
 	cipher, err := vault.NewCipher(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := NewIntegrationStore(pool, cipher)
 	now := time.Date(2026, 8, 31, 8, 0, 0, 0, time.UTC)
-	item := integration.Integration{ID: shared.ID("integration-" + suffix), TenantID: tenantA, Provider: "jenkins", Name: "Jenkins", Endpoint: "https://jenkins.example.com", Config: []byte(`{}`), PollInterval: time.Minute, Version: 1, CreatedAt: now, UpdatedAt: now}
+	item := integration.Integration{ID: shared.ID("integration-" + suffix), TenantID: tenantA, Provider: "jenkins", Name: "Jenkins", Endpoint: "https://jenkins.example.com", Config: []byte(`{"nested":{"a":1,"b":2},"scope":"all"}`), PollInterval: time.Minute, Version: 1, CreatedAt: now, UpdatedAt: now}
 	actx := shared.WithTenant(ctx, tenantA)
 	if err := store.CreateIntegration(actx, item, integrationMutationAudit("integration.created", item.ID, now)); err != nil {
 		t.Fatal(err)
@@ -122,6 +137,31 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 	resolved, err := store.ResolveIntegrationCredential(actx, item.ID, "default", current.CredentialRevision)
 	if err != nil || string(resolved) != string(secret) {
 		t.Fatalf("resolved credential=%q err=%v", resolved, err)
+	}
+	if err := store.PutIntegrationCredential(actx, item.ID, "default", secret, item.Version, item.ConnectionRevision, integrationMutationAudit("integration.credential_replaced", item.ID, now)); !errors.Is(err, shared.ErrConflict) {
+		t.Fatalf("stale credential replacement error=%v, want conflict", err)
+	}
+	if err := store.DeleteIntegrationCredential(actx, item.ID, "default", current.Version-1, current.ConnectionRevision, integrationMutationAudit("integration.credential_deleted", item.ID, now)); !errors.Is(err, shared.ErrConflict) {
+		t.Fatalf("stale credential deletion error=%v, want conflict", err)
+	}
+	renameOnly := current
+	renameOnly.Name = "Jenkins renamed"
+	renameOnly.Config = []byte(`{"scope":"all","nested":{"b":2,"a":1}}`)
+	renamed, err := store.UpdateIntegration(actx, renameOnly, current.Version, integrationMutationAudit("integration.updated", item.ID, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.ConnectionRevision != current.ConnectionRevision || renamed.CredentialRevision != current.CredentialRevision {
+		t.Fatalf("semantic rename advanced connection revisions: before=%+v after=%+v", current, renamed)
+	}
+	current = renamed
+	staleAdmission := integration.Operation{ID: shared.ID("operation-stale-" + suffix), TenantID: tenantA, IntegrationID: item.ID, Type: integration.OperationTest, State: integration.OperationQueued, JobID: "job-stale-" + suffix, Actor: "admin", ConnectionRevision: current.ConnectionRevision - 1, CredentialRevision: current.CredentialRevision, CreatedAt: now, UpdatedAt: now}
+	if _, err := store.StartIntegrationOperation(actx, staleAdmission, "integration.operation", []byte(`{}`), integrationOperationAudit(staleAdmission)); !errors.Is(err, shared.ErrConflict) {
+		t.Fatalf("stale operation admission error=%v, want conflict", err)
+	}
+	var staleJobCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE id=$1`, staleAdmission.JobID).Scan(&staleJobCount); err != nil || staleJobCount != 0 {
+		t.Fatalf("stale admission job count=%d err=%v", staleJobCount, err)
 	}
 
 	operation := integration.Operation{ID: shared.ID("operation-" + suffix), TenantID: tenantA, IntegrationID: item.ID, Type: integration.OperationTest, State: integration.OperationQueued, JobID: "job-" + suffix, Actor: "admin", ConnectionRevision: current.ConnectionRevision, CredentialRevision: current.CredentialRevision, CreatedAt: now, UpdatedAt: now}
@@ -180,8 +220,8 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 		t.Fatalf("cancelled operation=%+v err=%v", cancelled, err)
 	}
 	cancelledClaim, err := queue.Claim(ctx, time.Second, jobKind)
-	if err != nil || cancelledClaim == nil || cancelledClaim.ID != cancelledOperation.JobID {
-		t.Fatalf("cancelled claim=%+v err=%v", cancelledClaim, err)
+	if err != nil || cancelledClaim != nil {
+		t.Fatalf("cancelled job remained claimable: claim=%+v err=%v", cancelledClaim, err)
 	}
 	if afterCancel, execute, beginErr := restartedStore.BeginIntegrationOperation(actx, cancelledOperation.ID, now.Add(7*time.Second)); beginErr != nil || execute || afterCancel.State != integration.OperationCancelled {
 		t.Fatalf("cancelled redelivery=%+v execute=%v err=%v", afterCancel, execute, beginErr)
@@ -189,10 +229,6 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 	if lateFinish, finishErr := restartedStore.FinishIntegrationOperation(actx, cancelledOperation.ID, integration.OperationSucceeded, "advanced", integration.OperationCounts{Pipelines: 1}, nil, []integration.Pipeline{{ExternalKey: "/job/late", Name: "late", FullName: "late", Kind: "job"}}, now.Add(8*time.Second)); finishErr != nil || lateFinish.State != integration.OperationCancelled || lateFinish.Checkpoint != "" {
 		t.Fatalf("cancelled operation was materialized=%+v err=%v", lateFinish, finishErr)
 	}
-	if err := queue.Complete(actx, cancelledClaim.ID, cancelledClaim.Fence); err != nil {
-		t.Fatal(err)
-	}
-
 	deadLetterOperation := integration.Operation{ID: shared.ID("operation-dead-letter-" + suffix), TenantID: tenantA, IntegrationID: item.ID, Type: integration.OperationTest, State: integration.OperationQueued, JobID: "job-dead-letter-" + suffix, Actor: "admin", ConnectionRevision: current.ConnectionRevision, CredentialRevision: current.CredentialRevision, CreatedAt: now.Add(9 * time.Second), UpdatedAt: now.Add(9 * time.Second)}
 	if _, err := store.StartIntegrationOperation(actx, deadLetterOperation, jobKind, []byte(`{"operation_id":"`+deadLetterOperation.ID.String()+`"}`), integrationOperationAudit(deadLetterOperation)); err != nil {
 		t.Fatal(err)
@@ -232,6 +268,27 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	due, err := store.ListDueIntegrations(actx, time.Now().UTC().Add(2*time.Hour), 10)
+	if err != nil || len(due) != 1 || due[0].ID != item.ID {
+		t.Fatalf("due integrations=%+v err=%v", due, err)
+	}
+	cancelFencePoll := integration.Operation{ID: shared.ID("operation-poll-cancel-" + suffix), TenantID: tenantA, IntegrationID: item.ID, Type: integration.OperationPoll, State: integration.OperationQueued, JobID: "job-poll-cancel-" + suffix, Actor: "admin", ConnectionRevision: current.ConnectionRevision, CredentialRevision: current.CredentialRevision, CreatedAt: now.Add(12 * time.Second), UpdatedAt: now.Add(12 * time.Second)}
+	if _, err := store.StartIntegrationOperation(actx, cancelFencePoll, jobKind, []byte(`{}`), integrationOperationAudit(cancelFencePoll)); err != nil {
+		t.Fatal(err)
+	}
+	if _, execute, err := store.BeginIntegrationOperation(actx, cancelFencePoll.ID, now.Add(13*time.Second)); err != nil || !execute {
+		t.Fatalf("begin cancel-fence poll execute=%v err=%v", execute, err)
+	}
+	if _, err := store.CancelIntegrationOperation(actx, cancelFencePoll.ID, now.Add(14*time.Second), integrationMutationAudit("integration.operation_cancelled", cancelFencePoll.ID, now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinishIntegrationPoll(actx, cancelFencePoll.ID, integration.OperationSucceeded, "late", integration.OperationCounts{Runs: 1}, nil, []integration.ExternalRun{run}, now.Add(15*time.Second)); !errors.Is(err, shared.ErrConflict) {
+		t.Fatalf("cancelled poll publication error=%v, want conflict", err)
+	}
+	var cancelledRunCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM integration_external_runs WHERE tenant_id=$1 AND integration_id=$2 AND provider_key=$3`, tenantA.String(), item.ID.String(), run.ProviderKey).Scan(&cancelledRunCount); err != nil || cancelledRunCount != 0 {
+		t.Fatalf("cancelled poll run count=%d err=%v", cancelledRunCount, err)
+	}
 	pollOperation := integration.Operation{ID: shared.ID("operation-poll-" + suffix), TenantID: tenantA, IntegrationID: item.ID, Type: integration.OperationPoll, State: integration.OperationQueued, JobID: "job-poll-" + suffix, Actor: "admin", ConnectionRevision: current.ConnectionRevision, CredentialRevision: current.CredentialRevision, CreatedAt: now.Add(13 * time.Second), UpdatedAt: now.Add(13 * time.Second)}
 	pollOperation, err = store.StartIntegrationOperation(actx, pollOperation, jobKind, []byte(`{}`), integrationOperationAudit(pollOperation))
 	if err != nil {
@@ -264,7 +321,8 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 	if _, err := pool.Exec(ctx, `INSERT INTO project_analyses(id,tenant_id,project_id,created_at,payload) VALUES($1,$2,$3,$4,$5)`, analysisOne.String(), tenantA.String(), projectA.String(), now, []byte(`{"source_commit":"abc123"}`)); err != nil {
 		t.Fatal(err)
 	}
-	matched, correlation, err := store.MatchIntegrationAnalysis(actx, projectA, "abc123")
+	matcher := NewProjectAnalysisStore(pool)
+	matched, correlation, err := matcher.MatchIntegrationAnalysis(actx, projectA, "abc123")
 	if err != nil || matched != analysisOne || correlation != integration.CorrelationLinked {
 		t.Fatalf("linked analysis=%q correlation=%q err=%v", matched, correlation, err)
 	}
@@ -272,11 +330,11 @@ func TestPostgresIntegrationStoreAtomicityRLSCredentialsAndUpsert(t *testing.T) 
 	if _, err := pool.Exec(ctx, `INSERT INTO project_analyses(id,tenant_id,project_id,created_at,payload) VALUES($1,$2,$3,$4,$5)`, analysisTwo.String(), tenantA.String(), projectA.String(), now.Add(time.Second), []byte(`{"source_revision":{"head":"abc123"}}`)); err != nil {
 		t.Fatal(err)
 	}
-	matched, correlation, err = store.MatchIntegrationAnalysis(actx, projectA, "abc123")
+	matched, correlation, err = matcher.MatchIntegrationAnalysis(actx, projectA, "abc123")
 	if err != nil || !matched.IsZero() || correlation != integration.CorrelationAmbiguous {
 		t.Fatalf("ambiguous analysis=%q correlation=%q err=%v", matched, correlation, err)
 	}
-	matched, correlation, err = store.MatchIntegrationAnalysis(shared.WithTenant(ctx, tenantB), projectA, "abc123")
+	matched, correlation, err = matcher.MatchIntegrationAnalysis(shared.WithTenant(ctx, tenantB), projectA, "abc123")
 	if err != nil || !matched.IsZero() || correlation != integration.CorrelationMissing {
 		t.Fatalf("cross-tenant analysis=%q correlation=%q err=%v", matched, correlation, err)
 	}

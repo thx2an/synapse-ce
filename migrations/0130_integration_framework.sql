@@ -1,4 +1,7 @@
 -- +goose Up
+ALTER TABLE project_analyses
+    ADD CONSTRAINT project_analyses_tenant_id_id_unique UNIQUE (tenant_id, id);
+
 CREATE TABLE integrations (
     id                     TEXT PRIMARY KEY,
     tenant_id              TEXT NOT NULL REFERENCES tenants(id),
@@ -81,7 +84,7 @@ CREATE TABLE integration_operations (
     counts          JSONB NOT NULL DEFAULT '{}'::jsonb,
     errors          JSONB NOT NULL DEFAULT '[]'::jsonb,
     pipelines       JSONB NOT NULL DEFAULT '[]'::jsonb,
-    job_id          TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+	job_id          TEXT NOT NULL UNIQUE,
     actor           TEXT NOT NULL,
 	connection_revision INT NOT NULL,
 	credential_revision INT NOT NULL,
@@ -119,7 +122,7 @@ CREATE TABLE integration_external_runs (
     result               TEXT NOT NULL,
     revision             TEXT NOT NULL DEFAULT '',
     branch               TEXT NOT NULL DEFAULT '',
-    analysis_id          TEXT REFERENCES project_analyses(id) ON DELETE SET NULL,
+    analysis_id          TEXT,
     correlation          TEXT NOT NULL,
     queued_at            TIMESTAMPTZ,
     started_at           TIMESTAMPTZ,
@@ -131,6 +134,8 @@ CREATE TABLE integration_external_runs (
         REFERENCES integrations(tenant_id, id) ON DELETE CASCADE,
     CONSTRAINT integration_external_runs_binding_fk FOREIGN KEY (tenant_id, binding_id)
         REFERENCES integration_bindings(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT integration_external_runs_analysis_fk FOREIGN KEY (tenant_id, analysis_id)
+        REFERENCES project_analyses(tenant_id, id) ON DELETE SET NULL,
     CONSTRAINT integration_external_runs_provider_key_bounded CHECK (provider_key <> '' AND octet_length(provider_key) <= 1024),
     CONSTRAINT integration_external_runs_pipeline_key_bounded CHECK (pipeline_key <> '' AND octet_length(pipeline_key) <= 1024),
     CONSTRAINT integration_external_runs_lifecycle_check CHECK (lifecycle IN ('queued','running','completed')),
@@ -152,3 +157,4 @@ DROP TABLE integration_operations;
 DROP TABLE integration_bindings;
 DROP TABLE integration_credentials;
 DROP TABLE integrations;
+ALTER TABLE project_analyses DROP CONSTRAINT project_analyses_tenant_id_id_unique;

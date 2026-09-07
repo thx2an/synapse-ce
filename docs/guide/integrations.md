@@ -7,7 +7,7 @@ Synapse provides a tenant-scoped, provider-neutral framework for observing exter
 ## Jenkins workflow
 
 1. Open **Settings → Integrations** and choose the Jenkins provider descriptor.
-2. Enter a display name and an HTTPS Jenkins endpoint. Private-network access is off unless an administrator explicitly approves it.
+2. Enter a display name and an HTTPS Jenkins endpoint. Private-network access is off unless both a tenant administrator requests it and an operator enables `SYNAPSE_INTEGRATION_ALLOW_PRIVATE_NETWORK=true`.
 3. Save a Jenkins username and API token. Credentials are write-only: the browser clears them after save and the API returns only `credential_configured`.
 4. Run **Test connection**. Synapse refuses to enable an integration until a test operation succeeds.
 5. Run **Discover**, select a classic job, Pipeline, folder job, or multibranch job, and bind it to a Synapse Project.
@@ -40,6 +40,7 @@ Operations and durable queue jobs are inserted atomically in PostgreSQL. At-leas
 
 - Discovery recursively handles folders, organization folders, multibranch projects, Pipeline jobs, and classic jobs.
 - Job paths are canonical relative Jenkins paths; returned cross-origin URLs are rejected.
+- Jenkins must report its externally reachable URL with the same HTTPS origin and base path configured in Synapse. Explicit default port `:443` is treated as the same origin; reverse proxies that rewrite the origin or base path must set Jenkins' public URL accordingly.
 - Polling reads the Jenkins queue and recent builds, normalizing queued, running, completed, success, failure, unstable, aborted, not-built, and unknown states.
 - Revision extraction prefers `lastBuiltRevision`; a change-set fallback is accepted only when exactly one commit is present.
 - Correlation requires the binding's Project and an exact commit. Zero matches produce `missing`; more than one produces `ambiguous`; Synapse never guesses.
@@ -69,8 +70,10 @@ When metrics are enabled on the worker, `synapse_integration_operations_total` e
 - Credential bundles use AES-256-GCM with additional authenticated data bound to tenant, integration, and credential identity.
 - Secrets never enter durable job payloads, provider errors, audit metadata, logs, metrics, API responses, or stored browser state after save.
 - Endpoints require HTTPS and reject userinfo, queries, fragments, redirects, cross-origin provider URLs, and invalid TLS.
-- The connector resolves and validates addresses on every dial. Loopback, link-local, metadata, multicast, unspecified, and private destinations are blocked unless private-network access is explicitly enabled; dangerous special-use ranges remain blocked.
+- The connector resolves and validates addresses on every dial. Loopback, link-local, metadata, multicast, unspecified, carrier-grade NAT, IPv6 6to4 (`2002::/16`), and the well-known NAT64 prefix (`64:ff9b::/96`) are always blocked. Private destinations additionally require both the operator gate and the per-integration exception.
 - Responses, discovery depth, discovered pipeline count, builds per pipeline, operation errors, and persisted JSON are bounded.
+
+Private-network access is a deployment-level SSRF exception. Keep the operator gate off unless the deployment has an approved internal Jenkins origin and outbound network controls. Create/update audit entries record the normalized endpoint and whether this exception was requested; credential material is never audited.
 
 Custom CA bundles and insecure TLS are intentionally unsupported in this MVP. Add verified custom trust bundles only when deployment evidence requires them; never add a certificate-verification bypass.
 

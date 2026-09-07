@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -16,6 +17,15 @@ import (
 type integrationFailingAudit struct {
 	err     error
 	entries []ports.AuditEntry
+}
+
+type integrationFailingInvalidationQueue struct {
+	*JobQueue
+	err error
+}
+
+func (queue *integrationFailingInvalidationQueue) Invalidate(context.Context, string) error {
+	return queue.err
 }
 
 func (audit *integrationFailingAudit) Record(_ context.Context, entry ports.AuditEntry) error {
@@ -136,5 +146,75 @@ func TestStartIntegrationOperationRejectsStalePollAdmission(t *testing.T) {
 	}
 	if job, err := queue.Claim(ctx, time.Minute, "integration.operation"); err != nil || job != nil {
 		t.Fatalf("stale poll job queued: job=%+v err=%v", job, err)
+	}
+}
+
+func TestIntegrationMutationDoesNotAuditFailedJobInvalidation(t *testing.T) {
+	clock := idgen.SystemClock{}
+	ids := idgen.RandomID{}
+	baseQueue := NewJobQueue(ids, clock.Now)
+	queue := &integrationFailingInvalidationQueue{JobQueue: baseQueue, err: errors.New("queue unavailable")}
+	cipher, err := vault.NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit := &integrationFailingAudit{}
+	store := NewIntegrationStore(queue, cipher, clock, audit)
+	tenantID := shared.ID("tenant-1")
+	ctx := shared.WithTenant(context.Background(), tenantID)
+	now := time.Now().UTC()
+	item := integration.Integration{
+		ID: "integration-1", TenantID: tenantID, Provider: "jenkins", Name: "Jenkins", Endpoint: "https://jenkins.example.com",
+		Config: []byte(`{}`), PollInterval: time.Minute, Version: 1, ConnectionRevision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateIntegration(ctx, item, ports.AuditEntry{Actor: "admin", Action: "integration.created", Target: item.ID.String(), At: now}); err != nil {
+		t.Fatal(err)
+	}
+	operation := integration.Operation{
+		ID: "operation-1", TenantID: tenantID, IntegrationID: item.ID, Type: integration.OperationTest, State: integration.OperationQueued,
+		JobID: "placeholder", Actor: "admin", ConnectionRevision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := store.StartIntegrationOperation(ctx, operation, "integration.operation", []byte(`{}`), ports.AuditEntry{Actor: "admin", Action: "integration.operation_started", Target: operation.ID.String(), At: now}); err != nil {
+		t.Fatal(err)
+	}
+	auditCount := len(audit.entries)
+	changed := item
+	changed.Config = []byte(`{"scope":"changed"}`)
+	if _, err := store.UpdateIntegration(ctx, changed, item.Version, ports.AuditEntry{Actor: "admin", Action: "integration.updated", Target: item.ID.String(), At: now}); !errors.Is(err, queue.err) {
+		t.Fatalf("update invalidation error=%v", err)
+	}
+	if len(audit.entries) != auditCount {
+		t.Fatalf("failed mutation appended audit: entries=%+v", audit.entries)
+	}
+}
+
+func TestIntegrationBindingCountIsCappedAtAdmission(t *testing.T) {
+	clock := idgen.SystemClock{}
+	ids := idgen.RandomID{}
+	queue := NewJobQueue(ids, clock.Now)
+	cipher, err := vault.NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewIntegrationStore(queue, cipher, clock, &integrationFailingAudit{})
+	tenantID := shared.ID("tenant-1")
+	ctx := shared.WithTenant(context.Background(), tenantID)
+	now := time.Now().UTC()
+	item := integration.Integration{ID: "integration-1", TenantID: tenantID, Provider: "jenkins", Name: "Jenkins", Endpoint: "https://jenkins.example.com", Config: []byte(`{}`), PollInterval: time.Minute, Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateIntegration(ctx, item, ports.AuditEntry{Actor: "admin", Action: "integration.created", Target: item.ID.String(), At: now}); err != nil {
+		t.Fatal(err)
+	}
+	for index := range integration.MaxBindingsPerPoll + 1 {
+		binding := integration.Binding{
+			ID: shared.ID(fmt.Sprintf("binding-%03d", index)), TenantID: tenantID, IntegrationID: item.ID, ProjectID: "project-1",
+			ExternalKey: fmt.Sprintf("/job/pipeline-%03d", index), ExternalName: fmt.Sprintf("pipeline-%03d", index), Version: 1, CreatedAt: now, UpdatedAt: now,
+		}
+		err := store.CreateIntegrationBinding(ctx, binding, ports.AuditEntry{Actor: "admin", Action: "integration.binding_created", Target: binding.ID.String(), At: now})
+		if index < integration.MaxBindingsPerPoll && err != nil {
+			t.Fatalf("binding %d: %v", index, err)
+		}
+		if index == integration.MaxBindingsPerPoll && !errors.Is(err, shared.ErrValidation) {
+			t.Fatalf("binding above cap error=%v, want validation", err)
+		}
 	}
 }

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/KKloudTarus/synapse-ce/internal/domain/integration"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/projectanalysis"
 	"github.com/KKloudTarus/synapse-ce/internal/domain/shared"
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/ports"
@@ -23,6 +25,44 @@ func NewProjectAnalysisStore(pool *pgxpool.Pool) *ProjectAnalysisStore {
 }
 
 var _ ports.ProjectAnalysisStore = (*ProjectAnalysisStore)(nil)
+var _ ports.IntegrationAnalysisMatcher = (*ProjectAnalysisStore)(nil)
+
+func (r *ProjectAnalysisStore) MatchIntegrationAnalysis(ctx context.Context, projectID shared.ID, revision string) (analysisID shared.ID, state integration.CorrelationState, err error) {
+	tenantID, ok := shared.TenantFrom(ctx)
+	revision = strings.TrimSpace(revision)
+	if !ok || projectID.IsZero() || revision == "" {
+		return "", integration.CorrelationMissing, nil
+	}
+	var matches []shared.ID
+	err = WithContextTenant(ctx, r.pool, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, `SELECT id FROM project_analyses WHERE tenant_id=$1 AND project_id=$2
+			AND ((payload->>'source_commit')=$3 OR (payload#>>'{source_revision,head}')=$3)
+			ORDER BY created_at DESC,id COLLATE "C" DESC LIMIT 2`, tenantID.String(), projectID.String(), revision)
+		if queryErr != nil {
+			return fmt.Errorf("match integration analysis: %w", queryErr)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id shared.ID
+			if scanErr := rows.Scan(&id); scanErr != nil {
+				return scanErr
+			}
+			matches = append(matches, id)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return "", "", err
+	}
+	switch len(matches) {
+	case 0:
+		return "", integration.CorrelationMissing, nil
+	case 1:
+		return matches[0], integration.CorrelationLinked, nil
+	default:
+		return "", integration.CorrelationAmbiguous, nil
+	}
+}
 
 func (r *ProjectAnalysisStore) Save(ctx context.Context, analysis projectanalysis.Analysis) error {
 	return r.SaveWithResult(ctx, analysis, nil)

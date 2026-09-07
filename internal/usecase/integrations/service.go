@@ -15,15 +15,21 @@ import (
 )
 
 const (
-	JobKind              = "integration.operation"
-	credentialIdentity   = "default"
-	defaultHistoryLimit  = 50
-	pollOperationTimeout = 2 * time.Minute
+	JobKind                  = "integration.operation"
+	credentialIdentity       = "default"
+	defaultHistoryLimit      = 50
+	testOperationTimeout     = 30 * time.Second
+	discoverOperationTimeout = 5 * time.Minute
+	pollOperationTimeout     = 2 * time.Minute
 )
 
 type Job struct {
 	OperationID shared.ID `json:"operation_id"`
 }
+
+type safeOperationFailure string
+
+func (failure safeOperationFailure) Error() string { return string(failure) }
 
 type CreateInput struct {
 	TenantID            shared.ID
@@ -47,18 +53,20 @@ type UpdateInput struct {
 }
 
 type Service struct {
-	store    ports.IntegrationStore
-	registry *integration.Registry
-	projects ports.ProjectRepository
-	matcher  ports.IntegrationAnalysisMatcher
-	ids      ports.IDGenerator
-	clock    ports.Clock
-	observer ports.IntegrationObserver
-	runLock  ports.RunLocker
+	store               ports.IntegrationStore
+	registry            *integration.Registry
+	projects            ports.ProjectRepository
+	matcher             ports.IntegrationAnalysisMatcher
+	ids                 ports.IDGenerator
+	clock               ports.Clock
+	observer            ports.IntegrationObserver
+	runLock             ports.RunLocker
+	allowPrivateNetwork bool
 }
 
 func (service *Service) SetObserver(observer ports.IntegrationObserver) { service.observer = observer }
 func (service *Service) SetRunLock(runLock ports.RunLocker)             { service.runLock = runLock }
+func (service *Service) SetPrivateNetworkAllowed(allowed bool)          { service.allowPrivateNetwork = allowed }
 
 func NewService(store ports.IntegrationStore, registry *integration.Registry, projects ports.ProjectRepository, matcher ports.IntegrationAnalysisMatcher, ids ports.IDGenerator, clock ports.Clock) (*Service, error) {
 	if store == nil || registry == nil || projects == nil || matcher == nil || ids == nil || clock == nil {
@@ -72,6 +80,9 @@ func (service *Service) ProviderDescriptors() []integration.ProviderDescriptor {
 }
 
 func (service *Service) Create(ctx context.Context, input CreateInput) (integration.Integration, error) {
+	if input.AllowPrivateNetwork && !service.allowPrivateNetwork {
+		return integration.Integration{}, fmt.Errorf("%w: private-network integrations are disabled by the operator", shared.ErrValidation)
+	}
 	provider, err := integration.NormalizeProvider(input.Provider)
 	if err != nil {
 		return integration.Integration{}, err
@@ -100,7 +111,7 @@ func (service *Service) Create(ctx context.Context, input CreateInput) (integrat
 		return integration.Integration{}, err
 	}
 	tenantCtx := shared.WithTenant(ctx, item.TenantID)
-	audit := service.auditEntry(input.Actor, "integration.created", item.ID, map[string]string{"provider": string(item.Provider)})
+	audit := service.auditEntry(input.Actor, "integration.created", item.ID, integrationAuditMetadata(item))
 	if err := service.store.CreateIntegration(tenantCtx, item, audit); err != nil {
 		return integration.Integration{}, err
 	}
@@ -134,6 +145,9 @@ func (service *Service) Get(ctx context.Context, tenantID, id shared.ID) (integr
 }
 
 func (service *Service) Update(ctx context.Context, tenantID, id shared.ID, input UpdateInput) (integration.Integration, error) {
+	if input.AllowPrivateNetwork && !service.allowPrivateNetwork {
+		return integration.Integration{}, fmt.Errorf("%w: private-network integrations are disabled by the operator", shared.ErrValidation)
+	}
 	tenantID = shared.TenantOrDefault(tenantID)
 	tenantCtx := shared.WithTenant(ctx, tenantID)
 	current, err := service.store.GetIntegration(tenantCtx, id)
@@ -163,7 +177,7 @@ func (service *Service) Update(ctx context.Context, tenantID, id shared.ID, inpu
 	if err := current.Normalize(); err != nil {
 		return integration.Integration{}, err
 	}
-	audit := service.auditEntry(input.Actor, "integration.updated", id, map[string]string{"provider": string(current.Provider)})
+	audit := service.auditEntry(input.Actor, "integration.updated", id, integrationAuditMetadata(current))
 	updated, err := service.store.UpdateIntegration(tenantCtx, current, input.Version, audit)
 	if err != nil {
 		return integration.Integration{}, err
@@ -255,6 +269,13 @@ func (service *Service) CreateBinding(ctx context.Context, tenantID, integration
 	if _, err := service.projects.GetByID(tenantCtx, tenantID, projectID); err != nil {
 		return integration.Binding{}, err
 	}
+	bindings, err := service.store.ListIntegrationBindings(tenantCtx, integrationID)
+	if err != nil {
+		return integration.Binding{}, err
+	}
+	if len(bindings) >= integration.MaxBindingsPerPoll {
+		return integration.Binding{}, fmt.Errorf("%w: an integration supports at most %d bindings", shared.ErrValidation, integration.MaxBindingsPerPoll)
+	}
 	now := service.clock.Now().UTC()
 	binding := integration.Binding{ID: service.ids.NewID(), TenantID: tenantID, IntegrationID: integrationID, ProjectID: projectID, ExternalKey: externalKey, ExternalName: externalName, Version: 1, CreatedAt: now, UpdatedAt: now}
 	if err := binding.Normalize(); err != nil {
@@ -309,9 +330,12 @@ func (service *Service) StartOperation(ctx context.Context, tenantID, integratio
 	if err != nil {
 		return integration.Operation{}, fmt.Errorf("marshal integration job: %w", err)
 	}
-	audit := ports.AuditEntry{
-		Actor: operation.Actor, Action: "integration.operation_started", Target: operation.ID.String(), At: now,
-		Metadata: map[string]string{"integration_id": integrationID.String(), "operation": string(operationType), "provider": string(item.Provider)},
+	audit := ports.AuditEntry{}
+	if operation.Actor != "system:integration-scheduler" {
+		audit = ports.AuditEntry{
+			Actor: operation.Actor, Action: "integration.operation_started", Target: operation.ID.String(), At: now,
+			Metadata: map[string]string{"integration_id": integrationID.String(), "operation": string(operationType), "provider": string(item.Provider)},
+		}
 	}
 	operation, err = service.store.StartIntegrationOperation(tenantCtx, operation, JobKind, payload, audit)
 	if err != nil {
@@ -380,8 +404,10 @@ func retryIntegrationLeaseLoss(ctx context.Context, err error) error {
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	if parent, ok := ctx.Value(integrationLeaseContextKey{}).(context.Context); ok && parent.Err() == nil {
-		return fmt.Errorf("integration operation execution lease lost: %w", ports.ErrRetryable)
+	if ctx.Err() != nil {
+		if parent, ok := ctx.Value(integrationLeaseContextKey{}).(context.Context); ok && parent.Err() == nil {
+			return fmt.Errorf("integration operation execution lease lost: %w", ports.ErrRetryable)
+		}
 	}
 	return err
 }
@@ -429,6 +455,9 @@ func (service *Service) HandleJob(ctx context.Context, jobID string, payload []b
 	if err != nil {
 		return service.finishProviderFailure(executionCtx, item.Provider, operation, err)
 	}
+	if closer, ok := adapter.(interface{ Close() }); ok {
+		defer closer.Close()
+	}
 	switch operation.Type {
 	case integration.OperationTest:
 		return service.executeTest(executionCtx, item.Provider, operation, adapter)
@@ -464,7 +493,9 @@ func (service *Service) executeTest(ctx context.Context, provider integration.Pr
 	if !ok {
 		return service.finishProviderFailure(ctx, provider, operation, fmt.Errorf("provider lacks connection test capability"))
 	}
-	if err := tester.TestConnection(ctx); err != nil {
+	testCtx, cancel := context.WithTimeout(ctx, testOperationTimeout)
+	defer cancel()
+	if err := tester.TestConnection(testCtx); err != nil {
 		return service.finishProviderFailure(ctx, provider, operation, err)
 	}
 	finished, err := service.store.FinishIntegrationOperation(ctx, operation.ID, integration.OperationSucceeded, operation.Checkpoint, integration.OperationCounts{}, nil, nil, service.clock.Now().UTC())
@@ -479,12 +510,15 @@ func (service *Service) executeDiscover(ctx context.Context, provider integratio
 	if !ok {
 		return service.finishProviderFailure(ctx, provider, operation, fmt.Errorf("provider lacks discovery capability"))
 	}
-	pipelines, nextCheckpoint, err := discoverer.DiscoverPipelines(ctx, operation.Checkpoint)
+	discoverCtx, cancel := context.WithTimeout(ctx, discoverOperationTimeout)
+	defer cancel()
+	discoverCtx = integration.WithOperationBudget(discoverCtx, integration.MaxRequestsPerPoll, integration.MaxBytesPerPoll)
+	pipelines, nextCheckpoint, err := discoverer.DiscoverPipelines(discoverCtx, operation.Checkpoint)
 	if err != nil {
 		return service.finishProviderFailure(ctx, provider, operation, err)
 	}
 	if len(pipelines) > integration.MaxPipelines {
-		return service.finishProviderFailure(ctx, provider, operation, fmt.Errorf("provider returned too many pipelines"))
+		return service.finishProviderFailure(ctx, provider, operation, safeOperationFailure("provider returned too many pipelines"))
 	}
 	for index := range pipelines {
 		if err := pipelines[index].Normalize(); err != nil {
@@ -509,7 +543,7 @@ func (service *Service) executePoll(ctx context.Context, provider integration.Pr
 		return err
 	}
 	if len(bindings) > integration.MaxBindingsPerPoll {
-		return service.finishProviderFailure(ctx, provider, operation, fmt.Errorf("integration poll exceeds %d bindings", integration.MaxBindingsPerPoll))
+		return service.finishProviderFailure(ctx, provider, operation, safeOperationFailure(fmt.Sprintf("integration poll exceeds %d bindings", integration.MaxBindingsPerPoll)))
 	}
 	pollCtx, cancel := context.WithTimeout(ctx, pollOperationTimeout)
 	defer cancel()
@@ -538,7 +572,7 @@ func (service *Service) executePoll(ctx context.Context, provider integration.Pr
 			continue
 		}
 		if len(runs) > integration.MaxRunsPerPoll || len(allRuns)+len(runs) > integration.MaxRunsPerPoll {
-			return service.finishProviderFailure(ctx, provider, operation, fmt.Errorf("integration poll exceeds %d runs", integration.MaxRunsPerPoll))
+			return service.finishProviderFailure(ctx, provider, operation, safeOperationFailure(fmt.Sprintf("integration poll exceeds %d runs", integration.MaxRunsPerPoll)))
 		}
 		for index := range runs {
 			run := &runs[index]
@@ -553,6 +587,9 @@ func (service *Service) executePoll(ctx context.Context, provider integration.Pr
 			if run.Revision != "" {
 				run.AnalysisID, run.Correlation, err = service.matcher.MatchIntegrationAnalysis(pollCtx, binding.ProjectID, run.Revision)
 				if err != nil {
+					if errors.Is(err, integration.ErrOperationBudgetExceeded) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
+						return service.finishProviderFailure(ctx, provider, operation, fmt.Errorf("integration poll exhausted its operation budget: %w", err))
+					}
 					return err
 				}
 			}
@@ -592,17 +629,56 @@ func (service *Service) executePoll(ctx context.Context, provider integration.Pr
 }
 
 func (service *Service) finishProviderFailure(ctx context.Context, provider integration.Provider, operation integration.Operation, err error) error {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
 		return err
 	}
-	if integration.IsRetryable(err) {
+	if integration.IsRetryable(err) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, integration.ErrOperationBudgetExceeded) {
 		return integration.RetryableError(fmt.Errorf("integration provider operation failed"))
 	}
-	finished, finishErr := service.store.FinishIntegrationOperation(ctx, operation.ID, integration.OperationFailed, operation.Checkpoint, operation.Counts, []string{"provider operation failed"}, nil, service.clock.Now().UTC())
+	reason := "provider operation failed"
+	if errors.Is(err, context.DeadlineExceeded) {
+		reason = "integration operation deadline exceeded"
+	} else if errors.Is(err, integration.ErrOperationBudgetExceeded) {
+		reason = "integration operation budget exhausted"
+	} else {
+		var safeFailure safeOperationFailure
+		var providerError *integration.ProviderError
+		if errors.As(err, &safeFailure) {
+			reason = sanitizeOperationReason(safeFailure.Error())
+		} else if errors.As(err, &providerError) && providerError != nil && providerError.Err != nil {
+			reason = sanitizeOperationReason(providerError.Err.Error())
+		}
+	}
+	finished, finishErr := service.store.FinishIntegrationOperation(ctx, operation.ID, integration.OperationFailed, operation.Checkpoint, operation.Counts, []string{reason}, nil, service.clock.Now().UTC())
 	if finishErr == nil && finished.State == integration.OperationFailed {
 		service.observe(provider, operation.Type, integration.OperationFailed)
 	}
 	return finishErr
+}
+
+func sanitizeOperationReason(raw string) string {
+	clean := strings.Map(func(character rune) rune {
+		if character < 0x20 || character == 0x7f {
+			return ' '
+		}
+		return character
+	}, strings.TrimSpace(raw))
+	clean = strings.Join(strings.Fields(clean), " ")
+	if clean == "" {
+		return "provider operation failed"
+	}
+	if len(clean) > integration.MaxOperationErrorLen {
+		clean = clean[:integration.MaxOperationErrorLen]
+	}
+	return clean
+}
+
+func integrationAuditMetadata(item integration.Integration) map[string]string {
+	return map[string]string{
+		"provider":              string(item.Provider),
+		"endpoint":              item.Endpoint,
+		"allow_private_network": fmt.Sprintf("%t", item.AllowPrivateNetwork),
+	}
 }
 
 func (service *Service) observe(provider integration.Provider, operation integration.OperationType, outcome integration.OperationState) {

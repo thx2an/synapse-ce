@@ -375,6 +375,10 @@ type Config struct {
 	IntegrationSchedulerInterval   time.Duration
 	IntegrationSchedulerDispatch   int
 	IntegrationSchedulerQueueDepth int
+	// IntegrationAllowPrivateNetwork is an operator-controlled exception that permits
+	// tenant administrators to configure integrations targeting private address space.
+	// It is intentionally off by default because the API flag alone must not weaken SSRF controls.
+	IntegrationAllowPrivateNetwork bool
 	// Vulnerability rollout gates default off. Tenant-scoped mutations additionally require
 	// an explicit tenant allowlist entry; "*" enables all tenants. Dry-run records correlation
 	// differences without mutating occurrences, findings, actions, or notification outbox rows.
@@ -783,6 +787,7 @@ func Load() Config {
 		IntegrationSchedulerInterval:          getduration("SYNAPSE_INTEGRATION_SCHEDULER_POLL", time.Minute),
 		IntegrationSchedulerDispatch:          getint("SYNAPSE_INTEGRATION_SCHEDULER_DISPATCH_LIMIT", 10),
 		IntegrationSchedulerQueueDepth:        getint("SYNAPSE_INTEGRATION_SCHEDULER_MAX_QUEUE_DEPTH", 100),
+		IntegrationAllowPrivateNetwork:        getbool("SYNAPSE_INTEGRATION_ALLOW_PRIVATE_NETWORK", false),
 		VulnerabilityProviderSyncEnabled:      getbool("SYNAPSE_VULNERABILITY_PROVIDER_SYNC_ENABLED", false),
 		VulnerabilityOccurrenceWritesEnabled:  getbool("SYNAPSE_VULNERABILITY_OCCURRENCE_WRITES_ENABLED", false),
 		VulnerabilityFindingProjectionEnabled: getbool("SYNAPSE_VULNERABILITY_FINDING_PROJECTION_ENABLED", false),

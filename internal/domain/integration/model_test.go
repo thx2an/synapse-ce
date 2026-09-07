@@ -58,9 +58,15 @@ func TestCanonicalEndpointAndExternalKeyFailClosed(t *testing.T) {
 			t.Errorf("CanonicalEndpoint(%q) error = %v, want validation", endpoint, err)
 		}
 	}
-	for _, key := range []string{"https://jenkins.example.com/job/a", "/job/../admin", "/not-a-job"} {
+	for _, key := range []string{"https://jenkins.example.com/job/a", "/job/../admin", "/"} {
 		if _, err := CanonicalExternalKey(key); !errors.Is(err, shared.ErrValidation) {
 			t.Errorf("CanonicalExternalKey(%q) error = %v, want validation", key, err)
 		}
+	}
+	if key, err := CanonicalExternalKey("/group/project/.github/workflows/release.yml"); err != nil || key != "/group/project/.github/workflows/release.yml" {
+		t.Fatalf("provider-neutral key=%q err=%v", key, err)
+	}
+	if key, err := CanonicalExternalKey("/release/v1..v2"); err != nil || key != "/release/v1..v2" {
+		t.Fatalf("benign double-dot key=%q err=%v", key, err)
 	}
 }

@@ -9,6 +9,11 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **Provider-neutral external CI/CD integrations.** Adds tenant-isolated, write-only encrypted Jenkins
+  credentials; bounded SSRF-resistant test, discovery, and polling operations; Project bindings and
+  exact-commit correlation; durable scheduled work; normalized run history; and an operator-controlled,
+  default-off exception for approved private Jenkins origins.
+
 - **Project dependency graph and subtree export.** Project analyses now expose a bounded, deterministic
   dependency projection from the stored SBOM with direct/transitive relationships, reverse paths,
   vulnerability matches, license policy risk, and reachability annotations. A new interactive Project

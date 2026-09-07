@@ -14,7 +14,7 @@ import (
 )
 
 func TestBlockedAddresses(t *testing.T) {
-	for _, value := range []string{"127.0.0.1", "::1", "169.254.169.254", "0.0.0.0", "224.0.0.1", "100.64.0.1", "::ffff:127.0.0.1", "::ffff:169.254.169.254"} {
+	for _, value := range []string{"127.0.0.1", "::1", "169.254.169.254", "0.0.0.0", "224.0.0.1", "100.64.0.1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "2002:7f00:1::", "64:ff9b::7f00:1"} {
 		if !blocked(netip.MustParseAddr(value), true) {
 			t.Fatalf("always-blocked address accepted: %s", value)
 		}
@@ -38,6 +38,10 @@ func TestClientRejectsRedirects(t *testing.T) {
 	client := New(time.Second, false)
 	if err := client.CheckRedirect(&http.Request{}, nil); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Fatalf("redirect error = %v, want ErrUseLastResponse", err)
+	}
+	transport := client.Transport.(*http.Transport)
+	if transport.IdleConnTimeout <= 0 || transport.MaxIdleConns <= 0 || transport.MaxIdleConnsPerHost <= 0 || transport.MaxConnsPerHost <= 0 {
+		t.Fatalf("transport connection bounds are missing: %+v", transport)
 	}
 }
 

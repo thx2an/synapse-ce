@@ -197,11 +197,12 @@ func main() {
 		log.Error("integration provider registry init failed", "err", err)
 		os.Exit(1)
 	}
-	integrationService, err := integrationuc.NewService(integrationStore, integrationRegistry, postgres.NewProjectRepository(pool), integrationStore, ids, clock)
+	integrationService, err := integrationuc.NewService(integrationStore, integrationRegistry, postgres.NewProjectRepository(pool), postgres.NewProjectAnalysisStore(pool), ids, clock)
 	if err != nil {
 		log.Error("integration service init failed", "err", err)
 		os.Exit(1)
 	}
+	integrationService.SetPrivateNetworkAllowed(cfg.IntegrationAllowPrivateNetwork)
 	integrationService.SetRunLock(postgres.NewLeaseRunLock(pool, ids.NewID().String(), time.Minute))
 	var integrationMaintenanceTasks []func(context.Context)
 	if cfg.IntegrationSchedulerEnabled {
@@ -229,7 +230,7 @@ func main() {
 	if cfg.WorkerProfile == config.WorkerProfileIntegrations {
 		runWorkerRuntime(ctx, cfg, queue, map[string]worker.Handler{
 			integrationuc.JobKind: integrationJobHandler{svc: integrationService},
-		}, integrationMaintenanceTasks, leaderStore, auditLog, clock, ids, cfg.ReconTimeout+time.Minute, log)
+		}, integrationMaintenanceTasks, leaderStore, auditLog, clock, ids, 6*time.Minute, log)
 		return
 	}
 

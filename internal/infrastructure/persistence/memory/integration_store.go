@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -138,9 +137,6 @@ func (store *IntegrationStore) UpdateIntegration(ctx context.Context, item integ
 	originChanged := current.Endpoint != item.Endpoint
 	item.Enabled, item.Archived, item.CreatedAt = current.Enabled, current.Archived, current.CreatedAt
 	item.ConnectionRevision, item.CredentialRevision = current.ConnectionRevision, current.CredentialRevision
-	if err := store.recordAuditLocked(ctx, audit); err != nil {
-		return integration.Integration{}, err
-	}
 	if material {
 		if err := store.invalidateActiveOperationsLocked(ctx, tenantID, item.ID, store.clock.Now().UTC()); err != nil {
 			return integration.Integration{}, err
@@ -151,6 +147,9 @@ func (store *IntegrationStore) UpdateIntegration(ctx context.Context, item integ
 			delete(store.credentials, credentialKey(tenantID, item.ID, "default"))
 			item.CredentialRevision++
 		}
+	}
+	if err := store.recordAuditLocked(ctx, audit); err != nil {
+		return integration.Integration{}, err
 	}
 	item.Version = current.Version + 1
 	item.UpdatedAt = store.clock.Now().UTC()
@@ -187,6 +186,8 @@ func (store *IntegrationStore) SetIntegrationEnabled(ctx context.Context, id sha
 		if !tested {
 			return integration.Integration{}, shared.ErrConflict
 		}
+	} else if err := store.invalidateActiveOperationsLocked(ctx, tenantID, id, store.clock.Now().UTC()); err != nil {
+		return integration.Integration{}, err
 	}
 	if err := store.recordAuditLocked(ctx, audit); err != nil {
 		return integration.Integration{}, err
@@ -213,10 +214,10 @@ func (store *IntegrationStore) ArchiveIntegration(ctx context.Context, id shared
 	if item.Archived || item.Version != expectedVersion {
 		return shared.ErrConflict
 	}
-	if err := store.recordAuditLocked(ctx, audit); err != nil {
+	if err := store.invalidateActiveOperationsLocked(ctx, tenantID, id, store.clock.Now().UTC()); err != nil {
 		return err
 	}
-	if err := store.invalidateActiveOperationsLocked(ctx, tenantID, id, store.clock.Now().UTC()); err != nil {
+	if err := store.recordAuditLocked(ctx, audit); err != nil {
 		return err
 	}
 	for key := range store.credentials {
@@ -261,10 +262,10 @@ func (store *IntegrationStore) PutIntegrationCredential(ctx context.Context, int
 	if item.Archived || item.Version != expectedVersion || item.ConnectionRevision != expectedConnectionRevision {
 		return shared.ErrConflict
 	}
-	if err := store.recordAuditLocked(ctx, audit); err != nil {
+	if err := store.invalidateActiveOperationsLocked(ctx, tenantID, integrationID, store.clock.Now().UTC()); err != nil {
 		return err
 	}
-	if err := store.invalidateActiveOperationsLocked(ctx, tenantID, integrationID, store.clock.Now().UTC()); err != nil {
+	if err := store.recordAuditLocked(ctx, audit); err != nil {
 		return err
 	}
 	store.credentials[credentialKey(tenantID, integrationID, credentialID)] = ciphertext
@@ -295,10 +296,10 @@ func (store *IntegrationStore) DeleteIntegrationCredential(ctx context.Context, 
 	if item.Archived || item.Version != expectedVersion || item.ConnectionRevision != expectedConnectionRevision {
 		return shared.ErrConflict
 	}
-	if err := store.recordAuditLocked(ctx, audit); err != nil {
+	if err := store.invalidateActiveOperationsLocked(ctx, tenantID, integrationID, store.clock.Now().UTC()); err != nil {
 		return err
 	}
-	if err := store.invalidateActiveOperationsLocked(ctx, tenantID, integrationID, store.clock.Now().UTC()); err != nil {
+	if err := store.recordAuditLocked(ctx, audit); err != nil {
 		return err
 	}
 	delete(store.credentials, key)
@@ -366,6 +367,15 @@ func (store *IntegrationStore) CreateIntegrationBinding(ctx context.Context, bin
 		if existing.TenantID == tenantID && existing.IntegrationID == binding.IntegrationID && existing.ExternalKey == binding.ExternalKey {
 			return shared.ErrConflict
 		}
+	}
+	bindingCount := 0
+	for _, existing := range store.bindings {
+		if existing.TenantID == tenantID && existing.IntegrationID == binding.IntegrationID {
+			bindingCount++
+		}
+	}
+	if bindingCount >= integration.MaxBindingsPerPoll {
+		return fmt.Errorf("%w: an integration supports at most %d bindings", shared.ErrValidation, integration.MaxBindingsPerPoll)
 	}
 	if err := store.recordAuditLocked(ctx, audit); err != nil {
 		return err
@@ -436,13 +446,15 @@ func (store *IntegrationStore) StartIntegrationOperation(ctx context.Context, op
 	if err != nil {
 		return integration.Operation{}, err
 	}
-	if store.audit == nil {
+	if strings.TrimSpace(audit.Action) != "" && store.audit == nil {
 		_ = store.invalidateJobLocked(ctx, jobID)
 		return integration.Operation{}, fmt.Errorf("%w: integration audit logger is required", shared.ErrValidation)
 	}
-	if err := store.audit.Record(ctx, audit); err != nil {
-		_ = store.invalidateJobLocked(ctx, jobID)
-		return integration.Operation{}, err
+	if strings.TrimSpace(audit.Action) != "" {
+		if err := store.audit.Record(ctx, audit); err != nil {
+			_ = store.invalidateJobLocked(ctx, jobID)
+			return integration.Operation{}, err
+		}
 	}
 	operation.JobID = jobID
 	store.operations[tenantKey(tenantID, operation.ID)] = operation.Clone()
@@ -702,11 +714,4 @@ type MissingIntegrationAnalysisMatcher struct{}
 
 func (MissingIntegrationAnalysisMatcher) MatchIntegrationAnalysis(context.Context, shared.ID, string) (shared.ID, integration.CorrelationState, error) {
 	return "", integration.CorrelationMissing, nil
-}
-
-func cloneJSON[T any](value T) T {
-	encoded, _ := json.Marshal(value)
-	var clone T
-	_ = json.Unmarshal(encoded, &clone)
-	return clone
 }

@@ -46,11 +46,14 @@ var descriptor = integration.ProviderDescriptor{
 }
 
 type Adapter struct {
-	descriptor integration.ProviderDescriptor
-	base       *url.URL
-	client     *http.Client
-	username   string
-	token      string
+	descriptor  integration.ProviderDescriptor
+	base        *url.URL
+	client      *http.Client
+	username    string
+	token       string
+	queueLoaded bool
+	queueRuns   map[string][]integration.ExternalRun
+	queueErr    error
 }
 
 func Register(registry *integration.Registry) error {
@@ -82,6 +85,10 @@ func New(item integration.Integration, credentials integration.CredentialBundle)
 
 func (adapter *Adapter) Descriptor() integration.ProviderDescriptor { return adapter.descriptor }
 
+func (adapter *Adapter) Close() {
+	adapter.client.CloseIdleConnections()
+}
+
 func (adapter *Adapter) TestConnection(ctx context.Context) error {
 	var response struct {
 		Mode     string `json:"mode"`
@@ -102,8 +109,11 @@ func (adapter *Adapter) DiscoverPipelines(ctx context.Context, _ string) ([]inte
 	visitedNodes := 1 // the configured root
 	requestCount := 0
 	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
 		if requestCount >= maxDiscoveryNodes {
-			return nil, "", integration.PermanentError(fmt.Errorf("Jenkins discovery exceeds %d requests", maxDiscoveryNodes))
+			return nil, "", integration.PermanentError(fmt.Errorf("jenkins discovery exceeds %d requests", maxDiscoveryNodes))
 		}
 		folder := queue[0]
 		queue = queue[1:]
@@ -119,12 +129,15 @@ func (adapter *Adapter) DiscoverPipelines(ctx context.Context, _ string) ([]inte
 			return nil, "", err
 		}
 		for _, job := range response.Jobs {
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
 			visitedNodes++
 			if visitedNodes > maxDiscoveryNodes {
-				return nil, "", integration.PermanentError(fmt.Errorf("Jenkins discovery exceeds %d nodes", maxDiscoveryNodes))
+				return nil, "", integration.PermanentError(fmt.Errorf("jenkins discovery exceeds %d nodes", maxDiscoveryNodes))
 			}
 			if len(pipelines) >= integration.MaxPipelines {
-				return nil, "", integration.PermanentError(fmt.Errorf("Jenkins returned more than %d pipelines", integration.MaxPipelines))
+				return nil, "", integration.PermanentError(fmt.Errorf("jenkins returned more than %d pipelines", integration.MaxPipelines))
 			}
 			externalKey, err := adapter.externalKey(job.URL)
 			if err != nil {
@@ -132,7 +145,7 @@ func (adapter *Adapter) DiscoverPipelines(ctx context.Context, _ string) ([]inte
 			}
 			name := strings.TrimSpace(job.Name)
 			if name == "" {
-				return nil, "", integration.PermanentError(fmt.Errorf("Jenkins returned a job without a name"))
+				return nil, "", integration.PermanentError(fmt.Errorf("jenkins returned a job without a name"))
 			}
 			fullName := name
 			if folder.fullName != "" {
@@ -151,7 +164,7 @@ func (adapter *Adapter) DiscoverPipelines(ctx context.Context, _ string) ([]inte
 			}
 			if recurse {
 				if folder.depth >= maxFolderDepth {
-					return nil, "", integration.PermanentError(fmt.Errorf("Jenkins folder nesting exceeds %d levels", maxFolderDepth))
+					return nil, "", integration.PermanentError(fmt.Errorf("jenkins folder nesting exceeds %d levels", maxFolderDepth))
 				}
 				if _, exists := visited[externalKey]; !exists {
 					visited[externalKey] = struct{}{}
@@ -169,7 +182,7 @@ func (adapter *Adapter) DiscoverPipelines(ctx context.Context, _ string) ([]inte
 }
 
 func (adapter *Adapter) ReadRuns(ctx context.Context, binding integration.Binding, checkpoint string) ([]integration.ExternalRun, string, error) {
-	externalKey, err := integration.CanonicalExternalKey(binding.ExternalKey)
+	externalKey, err := canonicalJenkinsKey(binding.ExternalKey)
 	if err != nil {
 		return nil, checkpoint, integration.PermanentError(err)
 	}
@@ -241,7 +254,7 @@ type jenkinsBuild struct {
 
 func (adapter *Adapter) normalizeBuild(externalKey string, build jenkinsBuild) (integration.ExternalRun, error) {
 	if build.Number < 0 {
-		return integration.ExternalRun{}, fmt.Errorf("Jenkins returned an invalid build number")
+		return integration.ExternalRun{}, fmt.Errorf("jenkins returned an invalid build number")
 	}
 	providerKey := runProviderKey(externalKey, "build", build.Number)
 	if build.QueueID > 0 {
@@ -275,6 +288,17 @@ func (adapter *Adapter) normalizeBuild(externalKey string, build jenkinsBuild) (
 }
 
 func (adapter *Adapter) queuedRuns(ctx context.Context, externalKey string) ([]integration.ExternalRun, error) {
+	if !adapter.queueLoaded {
+		adapter.queueRuns, adapter.queueErr = adapter.loadQueuedRuns(ctx)
+		adapter.queueLoaded = true
+	}
+	if adapter.queueErr != nil {
+		return nil, adapter.queueErr
+	}
+	return append([]integration.ExternalRun(nil), adapter.queueRuns[externalKey]...), nil
+}
+
+func (adapter *Adapter) loadQueuedRuns(ctx context.Context) (map[string][]integration.ExternalRun, error) {
 	var response struct {
 		Items []struct {
 			ID           int64  `json:"id"`
@@ -292,24 +316,24 @@ func (adapter *Adapter) queuedRuns(ctx context.Context, externalKey string) ([]i
 	if err := adapter.get(ctx, "/queue/api/json", url.Values{"tree": {"items[id,url,inQueueSince,task[url],executable[number,url]]"}}, &response); err != nil {
 		return nil, err
 	}
-	runs := make([]integration.ExternalRun, 0)
+	runsByPipeline := make(map[string][]integration.ExternalRun)
 	for _, item := range response.Items {
 		taskKey, err := adapter.externalKey(item.Task.URL)
-		if err != nil || taskKey != externalKey || item.ID <= 0 {
+		if err != nil || item.ID <= 0 {
 			continue
 		}
 		queuedAt := time.UnixMilli(item.InQueueSince).UTC()
-		runURL, err := adapter.safeRunURL(item.URL, externalKey)
+		runURL, err := adapter.safeRunURL(item.URL, taskKey)
 		if err != nil {
 			return nil, integration.PermanentError(err)
 		}
 		run := integration.ExternalRun{
-			ProviderKey: runProviderKey(externalKey, "queue", item.ID), PipelineKey: externalKey, URL: runURL,
+			ProviderKey: runProviderKey(taskKey, "queue", item.ID), PipelineKey: taskKey, URL: runURL,
 			Lifecycle: integration.RunQueued, Result: integration.ResultUnknown, QueuedAt: &queuedAt, ProviderUpdatedAt: queuedAt,
 		}
 		if item.Executable != nil {
 			run.Number = strconv.FormatInt(item.Executable.Number, 10)
-			run.URL, err = adapter.safeRunURL(item.Executable.URL, externalKey)
+			run.URL, err = adapter.safeRunURL(item.Executable.URL, taskKey)
 			if err != nil {
 				return nil, integration.PermanentError(err)
 			}
@@ -317,9 +341,9 @@ func (adapter *Adapter) queuedRuns(ctx context.Context, externalKey string) ([]i
 			run.StartedAt = &queuedAt
 			run.ProviderUpdatedAt = time.Now().UTC()
 		}
-		runs = append(runs, run)
+		runsByPipeline[taskKey] = append(runsByPipeline[taskKey], run)
 	}
-	return runs, nil
+	return runsByPipeline, nil
 }
 
 func runProviderKey(externalKey, kind string, id int64) string {
@@ -403,7 +427,7 @@ func (adapter *Adapter) get(ctx context.Context, resource string, query url.Valu
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 	if err != nil {
-		return integration.PermanentError(fmt.Errorf("build Jenkins request: %w", err))
+		return integration.PermanentError(fmt.Errorf("build jenkins request: %w", err))
 	}
 	request.Header.Set("Accept", "application/json")
 	request.SetBasicAuth(adapter.username, adapter.token)
@@ -412,29 +436,29 @@ func (adapter *Adapter) get(ctx context.Context, resource string, query url.Valu
 		if errors.Is(err, context.Canceled) {
 			return err
 		}
-		return integration.RetryableError(fmt.Errorf("Jenkins request failed"))
+		return integration.RetryableError(fmt.Errorf("jenkins request failed"))
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	switch {
 	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		return integration.PermanentError(fmt.Errorf("Jenkins authentication failed"))
+		return integration.PermanentError(fmt.Errorf("jenkins authentication failed"))
 	case response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500:
-		return integration.RetryableError(fmt.Errorf("Jenkins temporarily unavailable"))
+		return integration.RetryableError(fmt.Errorf("jenkins temporarily unavailable"))
 	case response.StatusCode < 200 || response.StatusCode >= 300:
-		return integration.PermanentError(fmt.Errorf("Jenkins returned HTTP %d", response.StatusCode))
+		return integration.PermanentError(fmt.Errorf("jenkins returned HTTP %d", response.StatusCode))
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
-		return integration.RetryableError(fmt.Errorf("read Jenkins response: %w", err))
+		return integration.RetryableError(fmt.Errorf("read jenkins response: %w", err))
 	}
 	if len(body) > maxResponseBytes {
-		return integration.PermanentError(fmt.Errorf("Jenkins response exceeds %d bytes", maxResponseBytes))
+		return integration.PermanentError(fmt.Errorf("jenkins response exceeds %d bytes", maxResponseBytes))
 	}
 	if err := integration.ConsumeOperationBytes(ctx, int64(len(body))); err != nil {
 		return integration.PermanentError(err)
 	}
 	if err := json.Unmarshal(body, output); err != nil {
-		return integration.PermanentError(fmt.Errorf("Jenkins returned invalid JSON"))
+		return integration.PermanentError(fmt.Errorf("jenkins returned invalid JSON"))
 	}
 	return nil
 }
@@ -442,11 +466,11 @@ func (adapter *Adapter) get(ctx context.Context, resource string, query url.Valu
 func (adapter *Adapter) resourceURL(resource string, query url.Values) (*url.URL, error) {
 	unescaped, err := url.PathUnescape(strings.TrimPrefix(resource, "/"))
 	if err != nil {
-		return nil, fmt.Errorf("Jenkins resource path is invalid")
+		return nil, fmt.Errorf("jenkins resource path is invalid")
 	}
 	for _, segment := range strings.Split(unescaped, "/") {
 		if segment == "." || segment == ".." {
-			return nil, fmt.Errorf("Jenkins resource path is invalid")
+			return nil, fmt.Errorf("jenkins resource path is invalid")
 		}
 	}
 	resourceURL := *adapter.base
@@ -456,7 +480,7 @@ func (adapter *Adapter) resourceURL(resource string, query url.Values) (*url.URL
 	resourceURL.RawQuery = query.Encode()
 	resourceURL.Fragment = ""
 	if resourceURL.Scheme != adapter.base.Scheme || resourceURL.Host != adapter.base.Host {
-		return nil, fmt.Errorf("Jenkins resource left the configured origin")
+		return nil, fmt.Errorf("jenkins resource left the configured origin")
 	}
 	return &resourceURL, nil
 }
@@ -467,19 +491,26 @@ func (adapter *Adapter) externalKey(raw string) (string, error) {
 	}
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return "", fmt.Errorf("Jenkins returned an invalid job URL")
+		return "", fmt.Errorf("jenkins returned an invalid job URL")
 	}
 	if !parsed.IsAbs() {
 		parsed = adapter.base.ResolveReference(parsed)
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || !strings.EqualFold(parsed.Scheme, adapter.base.Scheme) || !strings.EqualFold(parsed.Host, adapter.base.Host) {
-		return "", fmt.Errorf("Jenkins returned a cross-origin job URL")
+	decodedPath, err := fullyDecodePath(parsed.EscapedPath())
+	if err != nil {
+		return "", err
+	}
+	if err := adapter.rejectCredentialReflection(decodedPath); err != nil {
+		return "", err
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || !sameOrigin(parsed, adapter.base) {
+		return "", fmt.Errorf("jenkins returned a cross-origin job URL")
 	}
 	basePath := strings.TrimSuffix(adapter.base.Path, "/")
 	if basePath != "" && !strings.HasPrefix(parsed.Path, basePath+"/") {
-		return "", fmt.Errorf("Jenkins returned a job URL outside the configured base path")
+		return "", fmt.Errorf("jenkins returned a job URL outside the configured base path")
 	}
-	return integration.CanonicalExternalKey(strings.TrimPrefix(parsed.Path, basePath))
+	return canonicalJenkinsKey(strings.TrimPrefix(parsed.Path, basePath))
 }
 
 func (adapter *Adapter) absolute(externalKey string) string {
@@ -497,23 +528,30 @@ func (adapter *Adapter) safeRunURL(raw, fallbackKey string) (string, error) {
 	if strings.TrimSpace(raw) == "" {
 		fallback := adapter.absolute(fallbackKey)
 		if fallback == "" {
-			return "", fmt.Errorf("Jenkins returned an invalid run URL")
+			return "", fmt.Errorf("jenkins returned an invalid run URL")
 		}
 		return fallback, nil
 	}
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return "", fmt.Errorf("Jenkins returned an invalid run URL")
+		return "", fmt.Errorf("jenkins returned an invalid run URL")
 	}
 	if !parsed.IsAbs() {
 		parsed = adapter.base.ResolveReference(parsed)
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || !strings.EqualFold(parsed.Scheme, adapter.base.Scheme) || !strings.EqualFold(parsed.Host, adapter.base.Host) {
-		return "", fmt.Errorf("Jenkins returned an unsafe run URL")
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || !sameOrigin(parsed, adapter.base) {
+		return "", fmt.Errorf("jenkins returned an unsafe run URL")
 	}
 	basePath := strings.TrimSuffix(adapter.base.Path, "/")
 	if basePath != "" && parsed.Path != basePath && !strings.HasPrefix(parsed.Path, basePath+"/") {
-		return "", fmt.Errorf("Jenkins returned a run URL outside the configured base path")
+		return "", fmt.Errorf("jenkins returned a run URL outside the configured base path")
+	}
+	decodedPath, err := fullyDecodePath(parsed.EscapedPath())
+	if err != nil {
+		return "", err
+	}
+	if err := adapter.rejectCredentialReflection(decodedPath); err != nil {
+		return "", err
 	}
 	resource := strings.TrimPrefix(parsed.Path, basePath)
 	safe, err := adapter.resourceURL(resource, nil)
@@ -529,13 +567,64 @@ func (adapter *Adapter) safeRunURL(raw, fallbackKey string) (string, error) {
 
 func (adapter *Adapter) rejectCredentialReflection(values ...string) error {
 	encodedBasic := base64.StdEncoding.EncodeToString([]byte(adapter.username + ":" + adapter.token))
-	markers := []string{adapter.username, adapter.token, adapter.username + ":" + adapter.token, encodedBasic, "Basic " + encodedBasic}
+	markers := []string{adapter.token, adapter.username + ":" + adapter.token, encodedBasic, "Basic " + encodedBasic}
 	for _, value := range values {
 		for _, marker := range markers {
 			if marker != "" && strings.Contains(value, marker) {
-				return fmt.Errorf("Jenkins response contains credential material")
+				return fmt.Errorf("jenkins response contains credential material")
 			}
 		}
 	}
 	return nil
+}
+
+func fullyDecodePath(raw string) (string, error) {
+	current, err := url.PathUnescape(raw)
+	if err != nil {
+		return "", fmt.Errorf("jenkins returned an invalid URL path")
+	}
+	if strings.Contains(strings.ToLower(current), "%25") {
+		return "", fmt.Errorf("jenkins returned an ambiguously encoded URL path")
+	}
+	for range 8 {
+		next, decodeErr := url.PathUnescape(current)
+		if decodeErr != nil {
+			return "", fmt.Errorf("jenkins returned an invalid URL path")
+		}
+		if next == current {
+			return current, nil
+		}
+		current = next
+	}
+	return "", fmt.Errorf("jenkins returned an excessively encoded URL path")
+}
+
+func canonicalJenkinsKey(raw string) (string, error) {
+	key, err := integration.CanonicalExternalKey(raw)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(key, "/job/") {
+		return "", fmt.Errorf("jenkins pipeline key must start with /job/")
+	}
+	return key, nil
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		effectivePort(left) == effectivePort(right)
+}
+
+func effectivePort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(value.Scheme, "https") {
+		return "443"
+	}
+	if strings.EqualFold(value.Scheme, "http") {
+		return "80"
+	}
+	return ""
 }

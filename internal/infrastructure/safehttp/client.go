@@ -9,7 +9,11 @@ import (
 	"time"
 )
 
-var carrierGradeNAT = netip.MustParsePrefix("100.64.0.0/10")
+var (
+	carrierGradeNAT = netip.MustParsePrefix("100.64.0.0/10")
+	sixToFour       = netip.MustParsePrefix("2002::/16")
+	nat64WellKnown  = netip.MustParsePrefix("64:ff9b::/96")
+)
 
 type lookupFunc func(context.Context, string, string) ([]netip.Addr, error)
 type dialFunc func(context.Context, string, string) (net.Conn, error)
@@ -29,7 +33,14 @@ func newClient(timeout time.Duration, allowPrivate bool, lookup lookupFunc, dial
 			return http.ErrUseLastResponse
 		},
 		Transport: &http.Transport{
-			Proxy: nil,
+			Proxy:                 nil,
+			ForceAttemptHTTP2:     true,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: timeout,
+			MaxIdleConns:          16,
+			MaxIdleConnsPerHost:   4,
+			MaxConnsPerHost:       8,
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 				host, port, err := net.SplitHostPort(address)
 				if err != nil {
@@ -57,14 +68,13 @@ func newClient(timeout time.Duration, allowPrivate bool, lookup lookupFunc, dial
 				}
 				return nil, fmt.Errorf("source endpoint has no usable address")
 			},
-			ForceAttemptHTTP2: true,
 		},
 	}
 }
 
 func blocked(address netip.Addr, allowPrivate bool) bool {
 	address = address.Unmap()
-	if !address.IsValid() || address.IsUnspecified() || address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() || address.IsMulticast() || carrierGradeNAT.Contains(address) {
+	if !address.IsValid() || address.IsUnspecified() || address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() || address.IsMulticast() || carrierGradeNAT.Contains(address) || sixToFour.Contains(address) || nat64WellKnown.Contains(address) {
 		return true
 	}
 	return !allowPrivate && address.IsPrivate()

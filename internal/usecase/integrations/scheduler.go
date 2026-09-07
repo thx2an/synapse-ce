@@ -27,7 +27,7 @@ type SchedulerConfig struct {
 
 type Scheduler struct {
 	store      ports.IntegrationStore
-	tenants    ports.VulnerabilityReconciliationTenantStore
+	tenants    ports.TenantLister
 	queue      ports.JobQueue
 	service    *Service
 	clock      ports.Clock
@@ -36,7 +36,7 @@ type Scheduler struct {
 	log        *slog.Logger
 }
 
-func NewScheduler(store ports.IntegrationStore, tenants ports.VulnerabilityReconciliationTenantStore, queue ports.JobQueue, service *Service, clock ports.Clock, leadership Leadership, config SchedulerConfig, log *slog.Logger) (*Scheduler, error) {
+func NewScheduler(store ports.IntegrationStore, tenants ports.TenantLister, queue ports.JobQueue, service *Service, clock ports.Clock, leadership Leadership, config SchedulerConfig, log *slog.Logger) (*Scheduler, error) {
 	if store == nil || tenants == nil || queue == nil || service == nil || clock == nil || leadership == nil || config.Interval <= 0 || config.DispatchLimit <= 0 || config.MaxQueueDepth <= 0 {
 		return nil, fmt.Errorf("%w: integration scheduler configuration is invalid", shared.ErrValidation)
 	}

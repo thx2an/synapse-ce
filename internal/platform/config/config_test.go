@@ -383,6 +383,7 @@ func TestLoadIntegrationSchedulerDefaultsAndOverrides(t *testing.T) {
 		"SYNAPSE_INTEGRATION_SCHEDULER_POLL",
 		"SYNAPSE_INTEGRATION_SCHEDULER_DISPATCH_LIMIT",
 		"SYNAPSE_INTEGRATION_SCHEDULER_MAX_QUEUE_DEPTH",
+		"SYNAPSE_INTEGRATION_ALLOW_PRIVATE_NETWORK",
 	}
 	for _, key := range keys {
 		t.Setenv(key, "")
@@ -391,7 +392,8 @@ func TestLoadIntegrationSchedulerDefaultsAndOverrides(t *testing.T) {
 	if cfg.IntegrationSchedulerEnabled ||
 		cfg.IntegrationSchedulerInterval != time.Minute ||
 		cfg.IntegrationSchedulerDispatch != 10 ||
-		cfg.IntegrationSchedulerQueueDepth != 100 {
+		cfg.IntegrationSchedulerQueueDepth != 100 ||
+		cfg.IntegrationAllowPrivateNetwork {
 		t.Fatalf("integration scheduler defaults = %+v", cfg)
 	}
 
@@ -399,11 +401,13 @@ func TestLoadIntegrationSchedulerDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("SYNAPSE_INTEGRATION_SCHEDULER_POLL", "15s")
 	t.Setenv("SYNAPSE_INTEGRATION_SCHEDULER_DISPATCH_LIMIT", "25")
 	t.Setenv("SYNAPSE_INTEGRATION_SCHEDULER_MAX_QUEUE_DEPTH", "250")
+	t.Setenv("SYNAPSE_INTEGRATION_ALLOW_PRIVATE_NETWORK", "true")
 	cfg = Load()
 	if !cfg.IntegrationSchedulerEnabled ||
 		cfg.IntegrationSchedulerInterval != 15*time.Second ||
 		cfg.IntegrationSchedulerDispatch != 25 ||
-		cfg.IntegrationSchedulerQueueDepth != 250 {
+		cfg.IntegrationSchedulerQueueDepth != 250 ||
+		!cfg.IntegrationAllowPrivateNetwork {
 		t.Fatalf("integration scheduler overrides = %+v", cfg)
 	}
 }

@@ -176,10 +176,63 @@ func TestIntegrationHTTPWorkflowEnforcesRBACIsolationAndSecretRedaction(t *testi
 			t.Fatalf("integration response leaked %q: %s", forbiddenValue, getResponse.Body.String())
 		}
 	}
+	deleteCredential := httptest.NewRecorder()
+	deleteBody := fmt.Sprintf(`{"version":%d,"connection_revision":%d}`, got.Version, got.ConnectionRevision)
+	handler.ServeHTTP(deleteCredential, integrationHTTPRequest(http.MethodDelete, "/api/v1/integrations/"+created.ID.String()+"/credentials", deleteBody, string(user.RoleAdmin), "tenant-a"))
+	if deleteCredential.Code != http.StatusNoContent {
+		t.Fatalf("delete credential status=%d body=%s", deleteCredential.Code, deleteCredential.Body.String())
+	}
+	afterDelete := httptest.NewRecorder()
+	handler.ServeHTTP(afterDelete, integrationHTTPRequest(http.MethodGet, "/api/v1/integrations/"+created.ID.String(), "", string(user.RoleReadOnly), "tenant-a"))
+	var withoutCredential integrationDTO
+	if afterDelete.Code != http.StatusOK || json.Unmarshal(afterDelete.Body.Bytes(), &withoutCredential) != nil || withoutCredential.CredentialConfigured {
+		t.Fatalf("after credential delete status=%d body=%s", afterDelete.Code, afterDelete.Body.String())
+	}
 
 	crossTenant := httptest.NewRecorder()
 	handler.ServeHTTP(crossTenant, integrationHTTPRequest(http.MethodGet, "/api/v1/integrations/"+created.ID.String(), "", string(user.RoleReadOnly), "tenant-b"))
 	if crossTenant.Code != http.StatusNotFound {
 		t.Fatalf("cross-tenant get status=%d body=%s", crossTenant.Code, crossTenant.Body.String())
+	}
+}
+
+func TestIntegrationCredentialMutationsRequireOptimisticConcurrencyFields(t *testing.T) {
+	router := newIntegrationHTTPRouter(t)
+	handler := router.routes()
+	createdResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createdResponse, integrationHTTPRequest(http.MethodPost, "/api/v1/integrations", `{"provider":"fake-ci","name":"CI","endpoint":"https://ci.example.com","config":{},"poll_interval_seconds":60}`, string(user.RoleAdmin), "tenant-a"))
+	var created integrationDTO
+	if createdResponse.Code != http.StatusCreated || json.Unmarshal(createdResponse.Body.Bytes(), &created) != nil {
+		t.Fatalf("create status=%d body=%s", createdResponse.Code, createdResponse.Body.String())
+	}
+	for method, body := range map[string]string{
+		http.MethodPut:    `{"secrets":{"token":"secret"},"version":0,"connection_revision":0}`,
+		http.MethodDelete: `{"version":0,"connection_revision":0}`,
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, integrationHTTPRequest(method, "/api/v1/integrations/"+created.ID.String()+"/credentials", body, string(user.RoleAdmin), "tenant-a"))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s missing concurrency fields status=%d body=%s", method, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestIntegrationRoutesFailClosedForMachineAndMissingPrincipals(t *testing.T) {
+	mux := newIntegrationHTTPRouter(t).routes()
+	for _, test := range []struct {
+		name string
+		req  *http.Request
+	}{
+		{name: "missing principal", req: httptest.NewRequest(http.MethodGet, "/api/v1/integrations", nil)},
+		{name: "machine principal", req: integrationHTTPRequest(http.MethodGet, "/api/v1/integrations", "", "agent", "tenant-a")},
+		{name: "readonly mutation", req: integrationHTTPRequest(http.MethodPost, "/api/v1/integrations", `{}`, string(user.RoleReadOnly), "tenant-a")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, test.req)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
 	}
 }
