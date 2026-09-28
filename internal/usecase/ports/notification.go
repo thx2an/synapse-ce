@@ -104,3 +104,15 @@ type NotificationRepository interface {
 type NotificationSource interface {
 	Poll(context.Context, time.Time, int) (int, error)
 }
+
+// NotificationOutbox is how a producer records that something notifiable happened
+// (EPIC #1327 D2). Append runs inside the producer's TenantTransactionRunner.Run, so
+// the record commits or rolls back with the business write, and it refuses to run
+// outside one. Appending the same source twice records it once. A record that
+// predates the tenant's notification activation is not captured, the same rule the
+// capture trigger applies, so enabling notifications never replays old changes.
+// Producers never match rules or publish inside their transaction; the
+// NotificationSource projects the record later.
+type NotificationOutbox interface {
+	Append(context.Context, notification.SourceRecord) error
+}
